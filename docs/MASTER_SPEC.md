@@ -18,7 +18,7 @@ staleness-status: FRESH
 
 ## Mission
 
-Age-encrypted secret vault for RevFleet. Source of truth for every secret per the fleet-wide secrets rule. CLI + Tauri 2 desktop app. 100% [passage](https://github.com/FiloSottile/passage)-compatible.
+Age-encrypted secret vault for revealfleet. Source of truth for every secret per the fleet-wide secrets rule. CLI + Tauri 2 desktop app. 100% [passage](https://github.com/FiloSottile/passage)-compatible.
 
 The trust story compresses to one sentence: *Secrets live in RevVault, encrypted by an age identity that doesn't leave the developer's machine.*
 

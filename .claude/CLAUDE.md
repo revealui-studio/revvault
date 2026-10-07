@@ -14,7 +14,7 @@ Age-encrypted secret vault with CLI and Tauri desktop app.
 Requires Nix with flakes enabled. From WSL:
 
 ```bash
-cd ~/revfleet/revvault
+cd ~/revealfleet/revvault
 direnv allow  # or: nix develop
 cargo build --workspace
 cargo tauri dev

@@ -1,6 +1,6 @@
 # RevVault
 
-> The canonical secret store for the entire RevFleet. Age-encrypted vault with a CLI, a built-in TUI editor, and a Tauri desktop app. 100% [passage](https://github.com/FiloSottile/passage)-compatible.
+> The canonical secret store for the entire revealfleet. Age-encrypted vault with a CLI, a built-in TUI editor, and a Tauri desktop app. 100% [passage](https://github.com/FiloSottile/passage)-compatible.
 
 Per the fleet-wide [secrets rule](https://github.com/RevealUIStudio/revealui/blob/main/.claude/rules/secrets.md), every secret RevealUI depends on lives here — API keys, database URLs, webhook secrets, JWT/session keys, keypairs, license keys, OAuth client secrets, age identities, SSH keys, anything else. One encryption boundary (the age identity) gates the whole fleet; rotation updates one store and downstream targets (Vercel env vars, Fly app secrets) re-read from the same source.
 
@@ -29,7 +29,7 @@ Per the fleet-wide [secrets rule](https://github.com/RevealUIStudio/revealui/blo
 ### Build
 
 ```bash
-cd ~/revfleet/revvault
+cd ~/revealfleet/revvault
 direnv allow  # or: nix develop
 cargo build --workspace
 ```

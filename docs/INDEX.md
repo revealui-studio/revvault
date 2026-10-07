@@ -6,7 +6,7 @@ updated: 2026-07-23
 
 # RevVault — Documentation Index
 
-Age-encrypted credential vault for RevFleet. CLI + Tauri desktop app.
+Age-encrypted credential vault for revealfleet. CLI + Tauri desktop app.
 
 ## This repo's masters
 
@@ -15,4 +15,4 @@ Age-encrypted credential vault for RevFleet. CLI + Tauri desktop app.
 
 ## Fleet coordination
 
-Part of [RevFleet](https://github.com/RevealUIStudio). Cross-fleet coordination, planning, and lane tracking live in the agent dev environment — not in this public repo.
+Part of [revealfleet](https://github.com/RevealUIStudio). Cross-fleet coordination, planning, and lane tracking live in the agent dev environment — not in this public repo.

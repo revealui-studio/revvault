@@ -21,7 +21,7 @@ staleness-status: FRESH
 
 ## Headline state
 
-RevVault is the **canonical age-encrypted secret store** for RevFleet. CLI (`revvault`), optional TUI edit path, and Tauri 2 desktop app. Passage-compatible on-disk layout under `~/.revealui/passage-store` (override `REVVAULT_STORE`).
+RevVault is the **canonical age-encrypted secret store** for revealfleet. CLI (`revvault`), optional TUI edit path, and Tauri 2 desktop app. Passage-compatible on-disk layout under `~/.revealui/passage-store` (override `REVVAULT_STORE`).
 
 Workspace version: **`0.4.0`** (`Cargo.toml` `[workspace.package]`, `CHANGELOG.md`).
 
@@ -61,7 +61,7 @@ Workspace version: **`0.4.0`** (`Cargo.toml` `[workspace.package]`, `CHANGELOG.m
 
 ---
 
-## Composition with RevFleet
+## Composition with revealfleet
 
 RevVault is source of truth per fleet `secrets.md`. Consumers (RevealUI, RevDev, RevForge, …) read paths; they do not re-own encryption.
 

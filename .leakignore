@@ -22,5 +22,5 @@ frontend/src/components/SetupScreen.test.tsx   abs-home-path
 # it (mirrors the ci.yml anti-regression entries).
 .gitleaks.issues.toml                   lit-username,abs-home-path,private-jv-repo,private-jv-name
 
-# Materialized revfleet git hardline: ban-instruction names retired org email.
+# Materialized revealfleet git hardline: ban-instruction names retired org email.
 .claude/rules/git.md                    retired-org-email

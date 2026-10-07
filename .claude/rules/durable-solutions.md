@@ -50,3 +50,12 @@ alike. No "just this once" carve-out.
 - Disposition boundary: registering a hotfix is proposal-shaped; shipping the
   durable fix to production still needs the same authorization any
   disposition needs.
+
+## Fleet identity
+
+The only fleet identity is `revealfleet`. Configuration namespaces use
+`REVEALFLEET`. Preserve these exact spellings in paths, profiles, generated
+output, documentation, and session communication. Abbreviations and alternate
+aliases are prohibited. Rename maintained references in their owning primitive
+and regenerate consumers. Preserve original historical evidence for recovery;
+do not turn historical names into active aliases or repeat them in new output.
