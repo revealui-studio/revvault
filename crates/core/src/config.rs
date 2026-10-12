@@ -79,6 +79,9 @@ impl Config {
     ///   1. `~/.config/revvault/config.toml` `tmpdir`
     ///   2. `TMPDIR` env var
     pub fn resolve() -> Result<Self> {
+        if let Some(policy) = crate::service::ServicePolicy::current()? {
+            return Ok(policy.config());
+        }
         let file = ConfigFile::load()?;
         let store_dir = Self::resolve_store_dir(&file)?;
         let identity_file = Self::resolve_identity_file(&file)?;

@@ -5,6 +5,12 @@ use serde_json::json;
 
 #[derive(Args)]
 pub struct SetArgs {
+    /// Root-only, create-only import into one approved service secret.
+    #[arg(long, value_name = "UID", conflicts_with_all = [
+        "force", "multiline", "value", "operation_id",
+        "expected_current_sha256", "expected_absent"
+    ])]
+    pub service_uid: Option<u32>,
     /// Secret path (e.g., "credentials/stripe/secret-key")
     pub path: String,
 
@@ -44,7 +50,11 @@ pub(crate) fn stored_confirmation(path: &str, stored: &str) -> String {
 }
 
 pub fn run(args: SetArgs, json_output: bool) -> anyhow::Result<()> {
-    let store = super::open_store()?;
+    let store = if let Some(uid) = args.service_uid {
+        revvault_core::PassageStore::open_service_import(uid, &args.path)?
+    } else {
+        super::open_store()?
+    };
     let tty = io::stdin().is_terminal();
 
     if args.value.is_some() {

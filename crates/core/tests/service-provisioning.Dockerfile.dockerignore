@@ -1,0 +1,15 @@
+# Restrict the disposable fixture context to Cargo workspace sources.
+**
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+**/.git
+**/target
+**/.env
+**/.env.*
+**/*.age
+**/*.pem
+**/*.key
+**/identity.txt
+**/keys.txt

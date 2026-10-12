@@ -7,7 +7,18 @@ license.workspace = true
 authors.workspace = true
 description = "Shared vault library for Revvault — age-encrypted secret store"
 
+[features]
+native-service-tests = []
+
+[[test]]
+name = "service_provisioning_native"
+required-features = ["native-service-tests"]
+
 [dependencies]
+libc = { workspace = true }
+zeroize = { workspace = true }
+tempfile = "3"
+rust-embed = { version = "8", features = ["debug-embed", "deterministic-timestamps"] }
 async-trait = "0.1.92"
 age = { workspace = true }
 anyhow = { workspace = true }
@@ -32,7 +43,6 @@ fs2 = "0.4.3"
 atomic-write-file = "0.3.1"
 
 [dev-dependencies]
-tempfile = "3"
 age = { workspace = true }
 secrecy = { workspace = true }
 mockito = "1"

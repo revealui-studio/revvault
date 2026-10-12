@@ -151,27 +151,65 @@ impl PassageStore {
 
     pub(super) fn operation_lock(&self, exclusive: bool) -> Result<StoreLock> {
         let state = self.config.store_dir.join(".revvault");
-        // Serialize initial directory creation using idempotent mkdir. The
-        // lock itself is permanent; ownership is OS-held, never existence.
-        check_path(&self.config.store_dir, &state)?;
-        match std::fs::create_dir(&state) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
-                }
-                sync_directory(&self.config.store_dir)?;
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
         let path = state.join("store.lock");
+        check_path(&self.config.store_dir, &state)?;
         check_path(&self.config.store_dir, &path)?;
         check_regular(&path)?;
+
+        if let Some(policy) = &self.service {
+            if exclusive && self.service_import_path.is_none() {
+                return Err(RevvaultError::Other(anyhow::anyhow!(
+                    "revvault_service_capability_denied"
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                for (entry, mode, directory) in [
+                    (state.as_path(), 0o750, true),
+                    (path.as_path(), 0o640, false),
+                ] {
+                    crate::service::immutable_path(entry)?;
+                    crate::service::private_service_path(entry, policy.uid)?;
+                    let metadata = std::fs::symlink_metadata(entry)?;
+                    if metadata.mode() & 0o7777 != mode
+                        || metadata.is_dir() != directory
+                        || (!directory
+                            && (!metadata.is_file()
+                                || metadata.nlink() != 1
+                                || metadata.len() != 0))
+                    {
+                        return Err(RevvaultError::Other(anyhow::anyhow!(
+                            "revvault_service_capability_denied"
+                        )));
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        } else {
+            // Personal stores retain lazy coordination initialization.
+            match std::fs::create_dir(&state) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+                    }
+                    sync_directory(&self.config.store_dir)?;
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
         let mut options = OpenOptions::new();
         options.read(true);
-        if exclusive || !path.try_exists()? {
+        if self.service.is_some() {
+            options.write(exclusive);
+        } else if exclusive || !path.try_exists()? {
             options.write(true).create(true).truncate(false);
         }
         #[cfg(unix)]
@@ -256,6 +294,7 @@ impl PassageStore {
         desired: &[u8],
         operation_id: &str,
     ) -> Result<OperationReceipt> {
+        self.assert_write()?;
         self.conditional_with_checkpoint(path, expected, desired, operation_id, |_| Ok(()))
     }
 

@@ -11,6 +11,7 @@ pub mod import;
 pub mod init;
 pub mod namespace;
 pub mod rotation;
+pub mod service;
 pub mod store;
 pub mod sync;
 
