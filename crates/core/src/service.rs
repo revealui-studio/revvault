@@ -288,6 +288,7 @@ mod tests {
             ]),
         }
     }
+    #[cfg(unix)]
     #[test]
     fn service_policy_binds_kernel_uid_exact_paths_and_dedicated_store() {
         let p = policy();
@@ -305,7 +306,7 @@ mod tests {
         }
         let mut config = p.config();
         p.assert_configuration(&config).unwrap();
-        config.identity_file = "/home/operator/.config/age/keys.txt".into();
+        config.identity_file = "/tmp/foreign-vault/identity.txt".into();
         assert!(p.assert_configuration(&config).is_err());
     }
     #[test]

@@ -642,6 +642,15 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn service_preview_rejects_unix_command_paths_on_windows() {
+        let policy = service_policy();
+        assert!(policy.validate(policy.uid).is_err());
+        assert!(service_init_plan(&policy).is_err());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn service_preview_has_fixed_paths_without_identity_or_ciphertext() {
         let policy = service_policy();
