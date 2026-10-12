@@ -1,0 +1,30 @@
+Native service primitive validation — 2026-10-12
+
+Source branch:
+  feat/native-acceptance-source-20261011
+
+Baseline:
+  479d365bc57fbc3333d4c1e5ed193a1a6ec10e5f
+
+Tested fixture image:
+  sha256:ec3cc18a532b21ef7e674ef45f7814b9a26edaccd5d48481f6dcf925a17efa7a
+
+Validation:
+  cargo fmt --all -- --check: passed
+  cargo clippy for core and CLI, all targets, native-service-tests,
+    locked dependencies, warnings denied: passed
+  git diff --check: passed
+  Earlier core/CLI regression suite: 287 passed, 1 real-store test ignored.
+  Disposable native provisioning and kernel-principal denial fixture: passed.
+  Fresh-container replacement using the same custody volume: passed.
+  Replacement preserved identity, recipients, policy and ciphertext without
+    reinitialization.
+  Temporary test volume removed after both fixture runs passed.
+
+The Docker runs used the exact image ID above, no network, two CPUs,
+2 GiB memory, and a 256-process limit.
+
+Scope:
+  These results cover the maintained RevVault service primitives.
+  They do not establish acceptance of coding launchers, publisher images,
+  hosted GitHub policy, backup/restore, or production deployment.

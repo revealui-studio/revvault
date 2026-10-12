@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -30,19 +31,58 @@ pub struct PassageStore {
     config: Config,
     identity: Identity,
     recipients: Vec<age::x25519::Recipient>,
+    service: Option<crate::service::ServicePolicy>,
+    service_import_path: Option<String>,
 }
 
 impl PassageStore {
     /// Open an existing store using resolved configuration.
     pub fn open(config: Config) -> Result<Self> {
+        let service = crate::service::ServicePolicy::current()?;
+        if let Some(policy) = &service {
+            policy.assert_configuration(&config)?;
+        }
         let identity = Identity::from_file(&config.identity_file)?;
         let recipients = crypto::load_recipients(&config.recipients_file)?;
 
-        Ok(Self {
+        let store = Self {
             config,
             identity,
             recipients,
-        })
+            service,
+            service_import_path: None,
+        };
+        store.assert_service_recipients()?;
+        Ok(store)
+    }
+
+    /// Root-only, create-only import bound to one approved secret in the same
+    /// immutable service capability. No personal configuration is consulted.
+    pub fn open_service_import(uid: u32, path: &str) -> Result<Self> {
+        let policy = crate::service::ServicePolicy::for_import(uid)?;
+        if !policy.allows_read(path) {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
+        let mut store = Self::open(policy.config())?;
+        store.service = Some(policy);
+        store.service_import_path = Some(path.into());
+        store.assert_service_recipients()?;
+        Ok(store)
+    }
+
+    fn assert_service_recipients(&self) -> Result<()> {
+        if self.service.is_some()
+            && (self.identity.as_identities().len() != 1
+                || self.recipients.len() != 1
+                || self.recipients[0].to_string() != self.identity.default_recipient().to_string())
+        {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
+        Ok(())
     }
 
     /// Get (decrypt) a secret by its path.
@@ -73,6 +113,24 @@ impl PassageStore {
 
     /// Create under the shared writer lock; never race a conditional write.
     pub fn set(&self, path: &str, plaintext: &[u8]) -> Result<()> {
+        let _custody_lock = if let Some(selected) = &self.service_import_path {
+            if selected != path || !root_import_caller() {
+                return Err(RevvaultError::Other(anyhow::anyhow!(
+                    "revvault_service_capability_denied"
+                )));
+            }
+            Some(crate::service::lock_custody(
+                self.service
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RevvaultError::Other(anyhow::anyhow!("revvault_service_capability_denied"))
+                    })?
+                    .uid,
+            )?)
+        } else {
+            self.assert_write()?;
+            None
+        };
         let _lock = self.operation_lock(true)?;
         self.require_no_pending()?;
         let file_path = self.checked_secret_path(path)?;
@@ -81,11 +139,19 @@ impl PassageStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        self.write_secret(path, plaintext)
+        if self.service_import_path.is_some() {
+            self.create_secret_parent(file_path.parent().unwrap())?;
+            let ciphertext = crypto::encrypt(plaintext, &self.recipients)?;
+            self.write_ciphertext(&file_path, &ciphertext, false)?;
+            operation::sync_directory(file_path.parent().unwrap())
+        } else {
+            self.write_secret(path, plaintext)
+        }
     }
 
     /// Atomic overwrite under the same writer lock as conditional promotion.
     pub fn upsert(&self, path: &str, plaintext: &[u8]) -> Result<()> {
+        self.assert_write()?;
         let _lock = self.operation_lock(true)?;
         self.require_no_pending()?;
         self.write_secret(path, plaintext)
@@ -121,6 +187,93 @@ impl PassageStore {
         let file_path = self.prepare_write_path(path)?;
         let ciphertext = crypto::encrypt(plaintext, &self.recipients)?;
         operation::atomic_write(&file_path, &ciphertext)
+    }
+
+    fn write_ciphertext(
+        &self,
+        destination: &Path,
+        ciphertext: &[u8],
+        overwrite: bool,
+    ) -> Result<()> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| RevvaultError::InvalidPath("missing parent".into()))?;
+        let mut pending = tempfile::NamedTempFile::new_in(parent)?;
+        pending.write_all(ciphertext)?;
+        #[cfg(unix)]
+        if self.service_import_path.is_some() {
+            let uid = self
+                .service
+                .as_ref()
+                .ok_or_else(|| {
+                    RevvaultError::Other(anyhow::anyhow!("revvault_service_capability_denied"))
+                })?
+                .uid;
+            set_import_permissions(pending.as_file(), uid, 0o640)?;
+        }
+        pending.as_file().sync_all()?;
+        if overwrite {
+            pending.persist(destination).map_err(|error| error.error)?;
+        } else {
+            pending
+                .persist_noclobber(destination)
+                .map_err(|error| error.error)?;
+        }
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    fn create_secret_parent(&self, parent: &Path) -> Result<()> {
+        if self.service_import_path.is_none() {
+            std::fs::create_dir_all(parent)?;
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let uid = self
+                .service
+                .as_ref()
+                .ok_or_else(|| {
+                    RevvaultError::Other(anyhow::anyhow!("revvault_service_capability_denied"))
+                })?
+                .uid;
+            let relative = parent
+                .strip_prefix(&self.config.store_dir)
+                .map_err(|_| RevvaultError::InvalidPath("foreign service parent".into()))?;
+            let mut current = self.config.store_dir.clone();
+            crate::service::immutable_path(&current)?;
+            crate::service::private_service_path(&current, uid)?;
+            for part in relative.components() {
+                if !matches!(part, std::path::Component::Normal(_)) {
+                    return Err(RevvaultError::InvalidPath("foreign service parent".into()));
+                }
+                current.push(part);
+                match std::fs::symlink_metadata(&current) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::DirBuilder::new().mode(0o700).create(&current)?;
+                        set_import_permissions(&std::fs::File::open(&current)?, uid, 0o750)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {}
+                }
+                crate::service::immutable_path(&current)?;
+                crate::service::private_service_path(&current, uid)?;
+                if !std::fs::metadata(&current)?.is_dir() {
+                    return Err(RevvaultError::InvalidPath(
+                        "non-directory service parent".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )))
+        }
     }
 
     /// List all secret entries, optionally filtered by a path prefix.
@@ -163,6 +316,13 @@ impl PassageStore {
                 .to_string_lossy()
                 .replace('\\', "/");
 
+            if self
+                .service
+                .as_ref()
+                .is_some_and(|policy| !policy.allows_read(&logical_path))
+            {
+                continue;
+            }
             if let Some(prefix) = prefix {
                 if !logical_path.starts_with(prefix) {
                     continue;
@@ -224,6 +384,7 @@ impl PassageStore {
 
     /// Delete a secret by its path.
     pub fn delete(&self, path: &str) -> Result<()> {
+        self.assert_write()?;
         let _lock = self.operation_lock(true)?;
         self.require_no_pending()?;
         let file_path = self.checked_secret_path(path)?;
@@ -249,7 +410,25 @@ impl PassageStore {
         &self.config.store_dir
     }
 
+    fn assert_write(&self) -> Result<()> {
+        if self.service.is_some() {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
+        Ok(())
+    }
+
     fn checked_secret_path(&self, path: &str) -> Result<PathBuf> {
+        if self
+            .service
+            .as_ref()
+            .is_some_and(|policy| !policy.allows_read(path))
+        {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
         validate_path(path)?;
         if path.split('/').next() == Some(".revvault") {
             return Err(RevvaultError::InvalidPath(
@@ -259,6 +438,13 @@ impl PassageStore {
         let file_path = self.config.store_dir.join(format!("{path}.age"));
         operation::check_path(&self.config.store_dir, &file_path)?;
         operation::check_regular(&file_path)?;
+        #[cfg(unix)]
+        if let Some(policy) = &self.service {
+            if self.service_import_path.is_none() {
+                crate::service::immutable_path(&file_path)?;
+                crate::service::private_service_path(&file_path, policy.uid)?;
+            }
+        }
         Ok(file_path)
     }
 
@@ -280,6 +466,29 @@ impl PassageStore {
             }
         }
     }
+}
+
+fn root_import_caller() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn set_import_permissions(file: &std::fs::File, uid: u32, mode: u32) -> Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+    if !root_import_caller() || unsafe { libc::fchown(file.as_raw_fd(), 0, uid) } != 0 {
+        return Err(RevvaultError::Other(anyhow::anyhow!(
+            "revvault_service_capability_denied"
+        )));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 /// Validate a secret path to prevent directory traversal and other attacks.

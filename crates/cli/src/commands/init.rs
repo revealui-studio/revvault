@@ -1,10 +1,25 @@
 use clap::Args;
 use serde_json::json;
 
-use revvault_core::init::{init_vault, InitOptions};
+use revvault_core::init::{
+    init_service_vault, init_vault, resume_service_vault, service_init_plan, InitOptions,
+};
+use revvault_core::service::ServicePolicy;
 
 #[derive(Args)]
 pub struct InitArgs {
+    /// Provision a fixed kernel-UID service vault from a reviewed policy (root only).
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["store_dir", "identity_file"])]
+    pub service_policy: Option<std::path::PathBuf>,
+
+    /// Preview service paths and secret selectors without creating keys or files.
+    #[arg(long, requires = "service_policy")]
+    pub dry_run: bool,
+
+    /// Resume an unchanged interrupted service initialization (root only).
+    #[arg(long, requires = "service_policy", conflicts_with = "dry_run")]
+    pub resume: bool,
+
     /// Override the store directory (default: ~/.revealui/passage-store)
     #[arg(long, value_name = "DIR")]
     pub store_dir: Option<std::path::PathBuf>,
@@ -15,6 +30,27 @@ pub struct InitArgs {
 }
 
 pub fn run(args: InitArgs, json_output: bool) -> anyhow::Result<()> {
+    if let Some(path) = args.service_policy {
+        let plan = if args.dry_run {
+            let policy: ServicePolicy = toml::from_str(&std::fs::read_to_string(&path)?)?;
+            service_init_plan(&policy)?
+        } else if args.resume {
+            resume_service_vault(&path)?
+        } else {
+            init_service_vault(&path)?
+        };
+        let output = serde_json::json!({
+            "status": if args.dry_run { "service_preview" } else if args.resume { "service_resumed" } else { "service_initialized" },
+            "plan": plan,
+            "credentialDelivery": "not performed",
+        });
+        if json_output {
+            println!("{}", serde_json::to_string(&output)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        return Ok(());
+    }
     let summary = init_vault(InitOptions {
         store_dir: args.store_dir,
         identity_file: args.identity_file,

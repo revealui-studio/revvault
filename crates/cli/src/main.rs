@@ -83,6 +83,13 @@ async fn main() -> anyhow::Result<()> {
 
     let json = cli.json;
 
+    // Service principals can invoke only policy-bound child delivery.
+    if revvault_core::service::ServicePolicy::current()?.is_some()
+        && !service_command_allowed(&cli.command)
+    {
+        anyhow::bail!("revvault_service_capability_denied");
+    }
+
     let result = match cli.command {
         Commands::Init(args) => commands::init::run(args, json),
         Commands::Get(args) => commands::get::run(args, json),
@@ -115,4 +122,89 @@ async fn main() -> anyhow::Result<()> {
     }
 
     result
+}
+
+fn service_command_allowed(command: &Commands) -> bool {
+    matches!(command, Commands::Run(_))
+}
+
+#[cfg(test)]
+mod service_dispatch_tests {
+    use super::*;
+    #[test]
+    fn service_import_cannot_force_rotation_or_print_multiline_input() {
+        for option in ["--force", "--multiline"] {
+            assert!(Cli::try_parse_from([
+                "revvault",
+                "set",
+                "--service-uid",
+                "19001",
+                option,
+                "revealfleet/publisher/synthetic-key",
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "revvault",
+            "set",
+            "--service-uid",
+            "19001",
+            "revealfleet/publisher/synthetic-key",
+        ])
+        .is_ok());
+    }
+    #[test]
+    fn service_initialization_cannot_select_personal_paths_or_implicitly_preview() {
+        for args in [
+            vec![
+                "revvault",
+                "init",
+                "--service-policy",
+                "/policy.toml",
+                "--store-dir",
+                "/personal",
+            ],
+            vec![
+                "revvault",
+                "init",
+                "--service-policy",
+                "/policy.toml",
+                "--identity-file",
+                "/personal/key",
+            ],
+            vec!["revvault", "init", "--dry-run"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "revvault",
+            "init",
+            "--service-policy",
+            "/policy.toml",
+            "--dry-run"
+        ])
+        .is_ok());
+    }
+    #[test]
+    fn services_cannot_print_export_mutate_or_call_providers() {
+        for args in [
+            vec!["revvault", "list"],
+            vec!["revvault", "get", "revealfleet/publisher/app-key"],
+            vec!["revvault", "set", "revealfleet/publisher/app-key"],
+            vec!["revvault", "delete", "revealfleet/publisher/app-key"],
+            vec!["revvault", "export-env", "revealfleet/publisher/env"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(!service_command_allowed(&cli.command));
+        }
+        let cli = Cli::try_parse_from([
+            "revvault",
+            "run",
+            "--",
+            "/usr/local/bin/node",
+            "/app/dist/publisher-run.js",
+        ])
+        .unwrap();
+        assert!(service_command_allowed(&cli.command));
+    }
 }
