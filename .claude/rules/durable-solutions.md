@@ -1,52 +1,56 @@
-# Durable Solutions — Long-Term First, Hotfixes Are Debt
+# Durable Solutions — Root Causes Only
 
-**Status:** convention. Applies to every session, product and internal work
-alike. No "just this once" carve-out.
+**Status:** convention for every session, product, and internal change. There is
+no one-off or hotfix exception.
 
 ## The rule
 
-1. **Prefer long-term durable solutions.** Fix root causes in the owning
-   layer (shared lib, env bootstrap, policy, product primitive) so the
-   failure class cannot recur. Session-local patches, ad hoc edits to
-   generated or environment files, one-off shell recipes, and "works on my
-   machine" overrides are not acceptable unless the project owner explicitly
-   accepts a registered hotfix.
-2. **Hotfixes are allowed only as registered debt.** If something needs to be
-   unblocked right now, a narrow hotfix may ship, but it must be registered
-   the same session. Unregistered hotfixes are policy violations, the same
-   class of problem as orphaned temp scripts.
-3. **Every hotfix has a durable destination.** Registration records: symptom,
-   temporary shape, durable target, owning path/repo, and what counts as
-   "converted." Pending hotfixes should surface at session boundaries until
-   resolved.
-4. **Extend before create still wins.** Durable does not mean greenfield.
-   Prefer hardening the existing primitive (a seed script, a hook, a
-   package, a gate) over standing up a parallel one-off.
+1. **Fix the owning primitive.** Change the shared code, configuration,
+   bootstrap, policy, or product behavior that causes the failure class. Add
+   tests or a gate where they can keep that class from returning.
+2. **Do not ship one-off solutions.** Session-local patches, machine or env
+   overrides, ad hoc operational scripts, symptom suppression, and parallel
+   paths are prohibited. Owner acceptance or a registry entry does not turn
+   one into an acceptable fix.
+3. **Record blockers as durable work.** If the root fix cannot be completed in
+   this session, identify the owning path, failing behavior, durable target,
+   validation needed, and tracked follow-up. Do not offer an interim procedure
+   that leaves the failure class open. A ticket records work; it is not a fix.
+4. **Inventory existing one-offs.** Search the affected code and operating
+   instructions for prior exceptions. Record each location, behavior, owner,
+   durable destination, and removal evidence. The hotfix registry is a debt
+   inventory for existing entries; it never authorizes a new one-off.
+5. **Extend before create.** Harden the existing primitive instead of adding
+   another resolver, seed script, gate bypass, or product path.
 
-## What counts as non-durable (must register or refuse)
+## Boundaries
 
-| Shape | Examples |
-|-------|----------|
-| Env / machine only | Editing a gitignored local env file without fixing the loader; an env-var override treated as the permanent recipe |
-| Session-only | Scratch scripts left for someone else to run; undocumented escape-hatch flags |
-| Symptom patch | Catch-and-ignore without a root fix; copying credentials into chat or docs |
-| Parallel path | A second seed script or a second resolver "just for this one case" |
-| Silent demotion | "We'll harden this later" with no registry entry and no tracked follow-up |
+| Shape | Treatment |
+|-------|-----------|
+| Env or machine override | Replace with a fix in the loader, bootstrap, or supported configuration model. |
+| Session-only recipe | Keep it out of product and operating instructions; implement the durable behavior. |
+| Symptom patch | Repair the cause rather than catch-and-ignore or disable a gate. |
+| Parallel path | Converge on the owning primitive and remove the duplicate path. |
+| Existing registered hotfix | Inventory it, track its durable replacement, and remove it after verification. |
 
-## What counts as durable
-
-- A shared module, rule, hook, or CI gate that fails closed for the whole
-  class of problem, not just the instance in front of you.
-- Documented escape hatches with explicit, named override flags.
-- A design doc or ticket when the durable fix needs multi-session design.
-- Tests that lock the durable behavior in place (prove red, then green).
+Temporary read-only diagnostics and synthetic test fixtures can help establish
+the cause. They are not product fixes and must not become operational
+dependencies. If an operation is needed repeatedly, implement it in the owning
+maintained tool with tests and normal review.
 
 ## Relationship to other conventions
 
-- Extend-before-create: durable means extending the real primitive, not
-  building a second one beside it.
-- Temp-scripts lifecycle: one-shot helper scripts are a related but separate
-  lifecycle (register, confirm, clean up) from hotfix debt.
-- Disposition boundary: registering a hotfix is proposal-shaped; shipping the
-  durable fix to production still needs the same authorization any
-  disposition needs.
+- Extend-before-create identifies the owning primitive to improve.
+- Temp-scripts rules govern the lifecycle of diagnostic files; they do not
+  permit one-off operational fixes.
+- Disposition rules still govern publication, deployment, and other external
+  actions after a durable fix is ready.
+
+## Fleet identity
+
+The only fleet identity is `revealfleet`. Configuration namespaces use
+`REVEALFLEET`. Preserve these exact spellings in paths, profiles, generated
+output, documentation, and session communication. Abbreviations and alternate
+aliases are prohibited. Rename maintained references in their owning primitive
+and regenerate consumers. Preserve original historical evidence for recovery;
+do not turn historical names into active aliases or repeat them in new output.

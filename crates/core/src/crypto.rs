@@ -37,7 +37,7 @@ pub fn decrypt(ciphertext: &[u8], identity: &Identity) -> Result<SecretString> {
         ));
     }
 
-    let mut decrypted = vec![];
+    let mut decrypted = zeroize::Zeroizing::new(Vec::new());
     let mut reader = decryptor
         .decrypt(
             identity
@@ -50,8 +50,9 @@ pub fn decrypt(ciphertext: &[u8], identity: &Identity) -> Result<SecretString> {
         .read_to_end(&mut decrypted)
         .map_err(|e: std::io::Error| RevvaultError::DecryptionFailed(e.to_string()))?;
 
-    let plaintext =
-        String::from_utf8(decrypted).map_err(|e| RevvaultError::DecryptionFailed(e.to_string()))?;
+    let plaintext = std::str::from_utf8(&decrypted)
+        .map_err(|e| RevvaultError::DecryptionFailed(e.to_string()))?
+        .to_owned();
 
     Ok(SecretString::from(plaintext))
 }
@@ -61,17 +62,24 @@ pub fn load_recipients(path: &std::path::Path) -> Result<Vec<x25519::Recipient>>
     let contents = std::fs::read_to_string(path)
         .map_err(|_| RevvaultError::RecipientsNotFound(path.to_path_buf()))?;
 
+    parse_recipients(&contents).map_err(|_| RevvaultError::RecipientsNotFound(path.to_path_buf()))
+}
+
+/// Shared strict recipient parser for files and independently encrypted
+/// service checkpoint contents.
+pub(crate) fn parse_recipients(contents: &str) -> Result<Vec<x25519::Recipient>> {
     let recipients: Vec<x25519::Recipient> = contents
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
             !trimmed.is_empty() && !trimmed.starts_with('#')
         })
-        .filter_map(|line| line.trim().parse::<x25519::Recipient>().ok())
-        .collect();
+        .map(|line| line.trim().parse::<x25519::Recipient>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| RevvaultError::DecryptionFailed("invalid age recipients".into()))?;
 
     if recipients.is_empty() {
-        return Err(RevvaultError::RecipientsNotFound(path.to_path_buf()));
+        return Err(RevvaultError::DecryptionFailed("no age recipients".into()));
     }
 
     Ok(recipients)
@@ -240,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn load_recipients_malformed_lines_are_skipped() {
+    fn load_recipients_rejects_malformed_lines_even_with_valid_recipient() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".age-recipients");
         let id = x25519::Identity::generate();
@@ -250,7 +258,42 @@ mod tests {
         )
         .unwrap();
 
-        let recipients = load_recipients(&path).unwrap();
-        assert_eq!(recipients.len(), 1);
+        assert!(load_recipients(&path).is_err());
+    }
+
+    #[test]
+    fn key_files_accept_comments_blank_lines_and_explicit_valid_sharing() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = x25519::Identity::generate();
+        let second = x25519::Identity::generate();
+        let recipients_path = dir.path().join(".age-recipients");
+        let identity_path = dir.path().join("identity.txt");
+        std::fs::write(
+            &recipients_path,
+            format!(
+                "# recipients\n\n{}\n  {}\n",
+                first.to_public(),
+                second.to_public()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &identity_path,
+            format!(
+                "# identities\n\n{}\n  {}\n",
+                first.to_string().expose_secret(),
+                second.to_string().expose_secret()
+            ),
+        )
+        .unwrap();
+        let recipients = load_recipients(&recipients_path).unwrap();
+        assert_eq!(recipients.len(), 2);
+        let identity = Identity::from_file(&identity_path).unwrap();
+        assert_eq!(identity.as_identities().len(), 2);
+        let ciphertext = encrypt(b"synthetic-shared-secret", &recipients).unwrap();
+        assert_eq!(
+            decrypt(&ciphertext, &identity).unwrap().expose_secret(),
+            "synthetic-shared-secret"
+        );
     }
 }

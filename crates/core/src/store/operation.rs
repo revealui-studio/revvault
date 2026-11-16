@@ -150,6 +150,7 @@ impl PassageStore {
     }
 
     pub(super) fn operation_lock(&self, exclusive: bool) -> Result<StoreLock> {
+        self.assert_write()?;
         let state = self.config.store_dir.join(".revvault");
         // Serialize initial directory creation using idempotent mkdir. The
         // lock itself is permanent; ownership is OS-held, never existence.
@@ -256,6 +257,7 @@ impl PassageStore {
         desired: &[u8],
         operation_id: &str,
     ) -> Result<OperationReceipt> {
+        self.assert_write()?;
         self.conditional_with_checkpoint(path, expected, desired, operation_id, |_| Ok(()))
     }
 

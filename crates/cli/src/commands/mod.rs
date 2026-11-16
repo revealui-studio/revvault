@@ -14,6 +14,7 @@ pub(crate) fn open_store() -> anyhow::Result<PassageStore> {
     })
 }
 
+pub mod backup;
 pub mod completions;
 pub mod delete;
 pub mod doctor;

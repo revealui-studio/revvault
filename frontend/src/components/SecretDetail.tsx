@@ -7,7 +7,12 @@ interface SecretDetailProps {
   onDeleted: () => void;
 }
 
-export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
+export function SecretDetail(props: SecretDetailProps) {
+  return <SelectedSecretDetail key={props.path} {...props} />;
+}
+
+function SelectedSecretDetail({ path, onDeleted }: SecretDetailProps) {
+  const active = useRef(true);
   const [shown, setShown] = useState(false);
   const [copied, setCopied] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -27,11 +32,11 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
   }
 
   useEffect(() => {
-    clearTimers();
-    setShown(false);
-    setCopied(false);
-    setError(null);
-  }, [path]);
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
 
   useEffect(() => () => clearTimers(), []);
 
@@ -49,6 +54,7 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
     try {
       // Native dialog in Rust. The command returns unit; JS never sees the value.
       await invoke("reveal_secret", { path });
+      if (!active.current) return;
       setShown(true);
       if (shownTimer.current !== null) {
         window.clearTimeout(shownTimer.current);
@@ -58,9 +64,9 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
         shownTimer.current = null;
       }, 2000);
     } catch (e) {
-      setError(String(e));
+      if (active.current) setError(String(e));
     } finally {
-      setLoading(false);
+      if (active.current) setLoading(false);
     }
   }
 
@@ -68,6 +74,7 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
     setError(null);
     try {
       await invoke("copy_secret", { path });
+      if (!active.current) return;
       setCopied(true);
       if (copiedTimer.current !== null) {
         window.clearTimeout(copiedTimer.current);
@@ -77,7 +84,7 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
         copiedTimer.current = null;
       }, 2000);
     } catch (e) {
-      setError(String(e));
+      if (active.current) setError(String(e));
     }
   }
 
@@ -86,9 +93,9 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
     setError(null);
     try {
       await invoke("delete_secret", { path });
-      onDeleted();
+      if (active.current) onDeleted();
     } catch (e) {
-      setError(String(e));
+      if (active.current) setError(String(e));
     }
   }
 

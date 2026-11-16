@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -30,31 +31,88 @@ pub struct PassageStore {
     config: Config,
     identity: Identity,
     recipients: Vec<age::x25519::Recipient>,
+    service: Option<crate::service::ServicePolicy>,
+    service_import_path: Option<String>,
 }
 
 impl PassageStore {
     /// Open an existing store using resolved configuration.
     pub fn open(config: Config) -> Result<Self> {
+        let service = crate::service::ServicePolicy::current()?;
+        Self::open_with_policy(config, service)
+    }
+
+    fn open_with_policy(
+        config: Config,
+        service: Option<crate::service::ServicePolicy>,
+    ) -> Result<Self> {
+        if let Some(policy) = &service {
+            policy.assert_configuration(&config)?;
+        } else {
+            config.assert_personal_paths()?;
+        }
         let identity = Identity::from_file(&config.identity_file)?;
         let recipients = crypto::load_recipients(&config.recipients_file)?;
 
-        Ok(Self {
+        let store = Self {
             config,
             identity,
             recipients,
-        })
+            service,
+            service_import_path: None,
+        };
+        store.assert_service_recipients()?;
+        Ok(store)
+    }
+
+    /// Root-only, create-only import bound to one approved secret in the same
+    /// immutable service capability. No personal configuration is consulted.
+    pub fn open_service_import(uid: u32, path: &str) -> Result<Self> {
+        let policy = crate::service::ServicePolicy::for_import(uid)?;
+        if !policy.allows_read(path) {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
+        let mut store = Self::open_with_policy(policy.config(), Some(policy))?;
+        store.service_import_path = Some(path.into());
+        store.assert_service_recipients()?;
+        Ok(store)
+    }
+
+    fn assert_service_recipients(&self) -> Result<()> {
+        if self.service.is_some()
+            && (self.identity.as_identities().len() != 1
+                || self.recipients.len() != 1
+                || self.recipients[0].to_string() != self.identity.default_recipient().to_string())
+        {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
+        Ok(())
     }
 
     /// Get (decrypt) a secret by its path.
     pub fn get(&self, path: &str) -> Result<SecretString> {
-        let _lock = self.operation_lock(false)?;
-        self.require_no_pending()?;
+        let _lock = self.read_lock()?;
         self.read_secret(path)
     }
 
     fn read_secret(&self, path: &str) -> Result<SecretString> {
         validate_path(path)?;
+        if let Some(policy) = &self.service {
+            if !policy.allows_read(path) {
+                return Err(RevvaultError::Other(anyhow::anyhow!(
+                    "revvault_service_capability_denied"
+                )));
+            }
+        }
         let file_path = self.checked_secret_path(path)?;
+        #[cfg(unix)]
+        if self.service.is_some() {
+            crate::service::immutable_path(&file_path)?;
+        }
         let ciphertext = match std::fs::read(&file_path) {
             Ok(value) => value,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -73,6 +131,7 @@ impl PassageStore {
 
     /// Create under the shared writer lock; never race a conditional write.
     pub fn set(&self, path: &str, plaintext: &[u8]) -> Result<()> {
+        self.checked_secret_path(path)?;
         let _lock = self.operation_lock(true)?;
         self.require_no_pending()?;
         let file_path = self.checked_secret_path(path)?;
@@ -84,8 +143,76 @@ impl PassageStore {
         self.write_secret(path, plaintext)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn import_guarded(
+        &self,
+        path: &str,
+        plaintext: &[u8],
+        guard: &crate::service::receiver::ServiceMutationGuard<'_>,
+    ) -> Result<()> {
+        if self.service_import_path.as_deref() != Some(path) {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
+        self.set_inner(path, plaintext, Some(guard))
+    }
+
+    fn set_inner(
+        &self,
+        path: &str,
+        plaintext: &[u8],
+        admission: Option<&crate::service::receiver::ServiceMutationGuard<'_>>,
+    ) -> Result<()> {
+        // Hold the same fixed-directory lock as a service backup, including
+        // parent creation and durable ciphertext publication.
+        let _custody_lock = if self.service_import_path.is_some() {
+            Some(crate::service::lock_custody(
+                self.service
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RevvaultError::Other(anyhow::anyhow!("revvault_service_capability_denied"))
+                    })?
+                    .uid,
+            )?)
+        } else {
+            None
+        };
+        if let Some(guard) = admission {
+            guard.recheck()?;
+        }
+        if let Some(selected) = &self.service_import_path {
+            if selected != path || !root_import_caller() {
+                return Err(RevvaultError::Other(anyhow::anyhow!(
+                    "revvault_service_capability_denied"
+                )));
+            }
+        } else {
+            self.assert_write()?;
+        }
+        validate_path(path)?;
+        let file_path = self.checked_secret_path(path)?;
+
+        if file_path.exists() {
+            return Err(RevvaultError::SecretAlreadyExists(path.to_string()));
+        }
+
+        // Ensure parent directories exist
+        if let Some(parent) = file_path.parent() {
+            self.create_secret_parent(parent)?;
+        }
+
+        let ciphertext = crypto::encrypt(plaintext, &self.recipients)?;
+        if let Some(guard) = admission {
+            guard.recheck()?;
+        }
+        self.write_ciphertext(&file_path, &ciphertext, false)?;
+        Ok(())
+    }
+
     /// Atomic overwrite under the same writer lock as conditional promotion.
     pub fn upsert(&self, path: &str, plaintext: &[u8]) -> Result<()> {
+        self.checked_secret_path(path)?;
         let _lock = self.operation_lock(true)?;
         self.require_no_pending()?;
         self.write_secret(path, plaintext)
@@ -123,10 +250,100 @@ impl PassageStore {
         operation::atomic_write(&file_path, &ciphertext)
     }
 
+    fn write_ciphertext(
+        &self,
+        destination: &Path,
+        ciphertext: &[u8],
+        overwrite: bool,
+    ) -> Result<()> {
+        if self.service.is_none() {
+            crate::service::assert_personal_path(destination)?;
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| RevvaultError::InvalidPath("missing parent".into()))?;
+        let mut pending = tempfile::NamedTempFile::new_in(parent)?;
+        pending.write_all(ciphertext)?;
+        #[cfg(unix)]
+        if self.service_import_path.is_some() {
+            let uid = self
+                .service
+                .as_ref()
+                .ok_or_else(|| {
+                    RevvaultError::Other(anyhow::anyhow!("revvault_service_capability_denied"))
+                })?
+                .uid;
+            set_import_permissions(pending.as_file(), uid, 0o640)?;
+        }
+        pending.as_file().sync_all()?;
+        if overwrite {
+            pending.persist(destination).map_err(|error| error.error)?;
+        } else {
+            pending
+                .persist_noclobber(destination)
+                .map_err(|error| error.error)?;
+        }
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    fn create_secret_parent(&self, parent: &Path) -> Result<()> {
+        if self.service_import_path.is_none() {
+            crate::service::assert_personal_path(parent)?;
+            std::fs::create_dir_all(parent)?;
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let uid = self
+                .service
+                .as_ref()
+                .ok_or_else(|| {
+                    RevvaultError::Other(anyhow::anyhow!("revvault_service_capability_denied"))
+                })?
+                .uid;
+            let relative = parent
+                .strip_prefix(&self.config.store_dir)
+                .map_err(|_| RevvaultError::InvalidPath("foreign service parent".into()))?;
+            let mut current = self.config.store_dir.clone();
+            crate::service::immutable_path(&current)?;
+            crate::service::private_service_path(&current, uid)?;
+            for part in relative.components() {
+                if !matches!(part, std::path::Component::Normal(_)) {
+                    return Err(RevvaultError::InvalidPath("foreign service parent".into()));
+                }
+                current.push(part);
+                match std::fs::symlink_metadata(&current) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::DirBuilder::new().mode(0o700).create(&current)?;
+                        set_import_permissions(&std::fs::File::open(&current)?, uid, 0o750)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {}
+                }
+                crate::service::immutable_path(&current)?;
+                crate::service::private_service_path(&current, uid)?;
+                if !std::fs::metadata(&current)?.is_dir() {
+                    return Err(RevvaultError::InvalidPath(
+                        "non-directory service parent".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )))
+        }
+    }
+
     /// List all secret entries, optionally filtered by a path prefix.
     pub fn list(&self, prefix: Option<&str>) -> Result<Vec<SecretEntry>> {
-        let _lock = self.operation_lock(false)?;
-        self.require_no_pending()?;
+        let _lock = self.read_lock()?;
         let mut entries = Vec::new();
 
         for entry in WalkDir::new(&self.config.store_dir)
@@ -162,6 +379,14 @@ impl PassageStore {
                 .with_extension("")
                 .to_string_lossy()
                 .replace('\\', "/");
+
+            if self
+                .service
+                .as_ref()
+                .is_some_and(|policy| !policy.allows_read(&logical_path))
+            {
+                continue;
+            }
 
             if let Some(prefix) = prefix {
                 if !logical_path.starts_with(prefix) {
@@ -224,6 +449,7 @@ impl PassageStore {
 
     /// Delete a secret by its path.
     pub fn delete(&self, path: &str) -> Result<()> {
+        self.checked_secret_path(path)?;
         let _lock = self.operation_lock(true)?;
         self.require_no_pending()?;
         let file_path = self.checked_secret_path(path)?;
@@ -249,6 +475,27 @@ impl PassageStore {
         &self.config.store_dir
     }
 
+    fn assert_write(&self) -> Result<()> {
+        if self.service.is_some() {
+            return Err(RevvaultError::Other(anyhow::anyhow!(
+                "revvault_service_capability_denied"
+            )));
+        }
+        self.config.assert_personal_paths()?;
+        Ok(())
+    }
+
+    fn read_lock(&self) -> Result<Option<operation::StoreLock>> {
+        // Service leaves are published atomically under the root custody lock.
+        // Readers cannot create the personal store's conditional-write journal.
+        if self.service.is_some() {
+            return Ok(None);
+        }
+        let lock = self.operation_lock(false)?;
+        self.require_no_pending()?;
+        Ok(Some(lock))
+    }
+
     fn checked_secret_path(&self, path: &str) -> Result<PathBuf> {
         validate_path(path)?;
         if path.split('/').next() == Some(".revvault") {
@@ -257,6 +504,9 @@ impl PassageStore {
             ));
         }
         let file_path = self.config.store_dir.join(format!("{path}.age"));
+        if self.service.is_none() {
+            crate::service::assert_personal_path(&file_path)?;
+        }
         operation::check_path(&self.config.store_dir, &file_path)?;
         operation::check_regular(&file_path)?;
         Ok(file_path)
@@ -280,6 +530,29 @@ impl PassageStore {
             }
         }
     }
+}
+
+fn root_import_caller() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn set_import_permissions(file: &std::fs::File, uid: u32, mode: u32) -> Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+    if !root_import_caller() || unsafe { libc::fchown(file.as_raw_fd(), 0, uid) } != 0 {
+        return Err(RevvaultError::Other(anyhow::anyhow!(
+            "revvault_service_capability_denied"
+        )));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 /// Validate a secret path to prevent directory traversal and other attacks.
@@ -307,6 +580,75 @@ fn validate_path(path: &str) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn generic_store_constructor_denies_service_custody_before_identity_reads() {
+        let policy = crate::service::ServicePolicy {
+            version: 1,
+            uid: 19001,
+            command: vec!["/usr/bin/true".into()],
+            environment: std::collections::BTreeMap::new(),
+            secrets: std::collections::BTreeMap::from([(
+                "KEY".into(),
+                "revealfleet/publisher/key".into(),
+            )]),
+        };
+        let error = PassageStore::open(policy.config()).err().unwrap();
+        assert_eq!(error.to_string(), "revvault_service_capability_denied");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn generic_writes_recheck_aliases_added_after_open() {
+        let (_dir, store) = setup_temp_store();
+        let alias = store.store_dir().join("foreign");
+        std::os::unix::fs::symlink("/var/lib/revvault", &alias).unwrap();
+        assert!(store.set("foreign/services/19001/new", b"denied").is_err());
+        assert!(store
+            .upsert("foreign/services/19001/new", b"denied")
+            .is_err());
+        assert!(alias.is_symlink());
+        assert_eq!(std::fs::read_dir(store.store_dir()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn service_import_rejects_root_uid_and_unprivileged_selection() {
+        assert!(PassageStore::open_service_import(0, "revealfleet/publisher/key").is_err());
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(PassageStore::open_service_import(19001, "revealfleet/publisher/key").is_err());
+        }
+    }
+
+    #[test]
+    fn service_store_rejects_foreign_or_shared_encryption_recipients() {
+        let (_dir, mut store) = setup_temp_store();
+        store.service = Some(crate::service::ServicePolicy {
+            version: 1,
+            uid: 19001,
+            command: vec!["/usr/bin/true".into()],
+            environment: std::collections::BTreeMap::new(),
+            secrets: std::collections::BTreeMap::from([(
+                "KEY".into(),
+                "revealfleet/publisher/key".into(),
+            )]),
+        });
+        store.assert_service_recipients().unwrap();
+        let own = store.recipients[0].clone();
+        let foreign = age::x25519::Identity::generate().to_public();
+        store.recipients = vec![own.clone(), foreign.clone()];
+        assert!(store.assert_service_recipients().is_err());
+        store.recipients = vec![foreign];
+        assert!(store.assert_service_recipients().is_err());
+        store.recipients = vec![own];
+        store.assert_service_recipients().unwrap();
+        store.identity = Identity::from_generated(vec![
+            age::x25519::Identity::generate(),
+            age::x25519::Identity::generate(),
+        ]);
+        assert!(store.assert_service_recipients().is_err());
+    }
 
     /// Create a temp store with a generated identity and recipients file.
     pub(crate) fn setup_temp_store() -> (tempfile::TempDir, PassageStore) {
@@ -354,6 +696,108 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn service_reads_and_conditional_denials_do_not_create_personal_journal() {
+        let (_dir, mut store) = setup_temp_store();
+        store.service = Some(crate::service::ServicePolicy {
+            version: 1,
+            uid: 1001,
+            command: vec!["/usr/bin/true".into()],
+            environment: Default::default(),
+            secrets: std::collections::BTreeMap::from([(
+                "KEY".into(),
+                "revealfleet/publisher/key".into(),
+            )]),
+        });
+        assert!(store.list(None).unwrap().is_empty());
+        assert!(store.get("credentials/personal/key").is_err());
+        for import in [false, true] {
+            store.service_import_path = import.then(|| "revealfleet/publisher/key".into());
+            let error = store
+                .compare_and_upsert(
+                    "revealfleet/publisher/key",
+                    ExpectedCurrent::Absent,
+                    b"synthetic",
+                    "35b4a913-3d30-4a23-9ac1-072a55dde99e",
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("capability_denied"));
+            assert!(store.set("revealfleet/publisher/key", b"denied").is_err());
+            assert!(store
+                .upsert("revealfleet/publisher/key", b"denied")
+                .is_err());
+            assert!(store.delete("revealfleet/publisher/key").is_err());
+        }
+        assert!(!store.store_dir().join(".revvault").exists());
+        assert!(!store.store_dir().join("revealfleet").exists());
+    }
+
+    #[test]
+    fn service_capability_filters_reads_lists_and_all_writes() {
+        let (_dir, mut store) = setup_temp_store();
+        store
+            .set("revealfleet/publisher/app-key", b"synthetic-app")
+            .unwrap();
+        store
+            .set("revealfleet/controller/app-key", b"synthetic-controller")
+            .unwrap();
+        store
+            .set("credentials/github/personal-token", b"synthetic-human")
+            .unwrap();
+        store.service = Some(crate::service::ServicePolicy {
+            version: 1,
+            uid: 1001,
+            command: vec!["/usr/local/bin/node".into()],
+            environment: Default::default(),
+            secrets: std::collections::BTreeMap::from([(
+                "REVEALFLEET_PUBLISHER_GITHUB_APP_PRIVATE_KEY".into(),
+                "revealfleet/publisher/app-key".into(),
+            )]),
+        });
+        let listed = store.list(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "revealfleet/publisher/app-key");
+        for path in [
+            "revealfleet/controller/app-key",
+            "credentials/github/personal-token",
+        ] {
+            assert!(store
+                .get(path)
+                .unwrap_err()
+                .to_string()
+                .contains("capability_denied"));
+        }
+        assert!(store.set("misc/key", b"denied").is_err());
+        assert!(store
+            .upsert("revealfleet/publisher/app-key", b"denied")
+            .is_err());
+        assert!(store.delete("revealfleet/publisher/app-key").is_err());
+        // The readable leaf still cannot be accessed through mutable fixture
+        // directories; real service data must be root-owned and immutable.
+        assert!(store.get("revealfleet/publisher/app-key").is_err());
+    }
+
+    #[test]
+    fn dedicated_service_identity_cannot_decrypt_other_principals_ciphertext() {
+        let (_a, source) = setup_temp_store();
+        let (_b, target) = setup_temp_store();
+        source
+            .set("revealfleet/controller/app-key", b"synthetic-controller")
+            .unwrap();
+        let ciphertext = std::fs::read(
+            source
+                .checked_secret_path("revealfleet/controller/app-key")
+                .unwrap(),
+        )
+        .unwrap();
+        let file = target
+            .checked_secret_path("revealfleet/publisher/app-key")
+            .unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, ciphertext).unwrap();
+        assert!(target.get("revealfleet/publisher/app-key").is_err());
+    }
+
+    #[test]
     fn set_rejects_duplicate() {
         let (_dir, store) = setup_temp_store();
 
@@ -371,6 +815,21 @@ pub(crate) mod tests {
 
         let secret = store.get("misc/token").unwrap();
         assert_eq!(secret.expose_secret(), "new_value");
+    }
+
+    #[test]
+    fn upsert_replaces_ciphertext_without_truncating_old_inode() {
+        let (dir, store) = setup_temp_store();
+        store.set("misc/token", b"old value").unwrap();
+        let saved = dir.path().join("original.age");
+        std::fs::hard_link(store.store_dir().join("misc/token.age"), &saved).unwrap();
+        let before = std::fs::read(&saved).unwrap();
+        store.upsert("misc/token", b"new value").unwrap();
+        assert_eq!(std::fs::read(saved).unwrap(), before);
+        assert_eq!(
+            store.get("misc/token").unwrap().expose_secret(),
+            "new value"
+        );
     }
 
     #[test]

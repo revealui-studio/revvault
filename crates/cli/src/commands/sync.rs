@@ -309,6 +309,7 @@ impl ScopeReceipt {
 /// `.revvault/` directory.
 fn append_audit_log(store: &PassageStore, entry: &AuditEntry) -> anyhow::Result<()> {
     let log_path = store.store_dir().join(".revvault/rotation-log.jsonl");
+    revvault_core::service::assert_personal_path(&log_path)?;
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }

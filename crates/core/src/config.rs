@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -28,10 +28,15 @@ impl ConfigFile {
             return Ok(Self::default());
         };
         let path = home.join(".config/revvault/config.toml");
+        Self::load_path(&path)
+    }
+
+    fn load_path(path: &Path) -> Result<Self> {
+        crate::service::assert_personal_path(path)?;
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(&path).map_err(RevvaultError::Io)?;
+        let raw = std::fs::read_to_string(path).map_err(RevvaultError::Io)?;
         toml::from_str(&raw).map_err(|e| {
             RevvaultError::Other(anyhow::anyhow!(
                 "malformed config file {}: {e}",
@@ -79,6 +84,9 @@ impl Config {
     ///   1. `~/.config/revvault/config.toml` `tmpdir`
     ///   2. `TMPDIR` env var
     pub fn resolve() -> Result<Self> {
+        if let Some(policy) = crate::service::ServicePolicy::current()? {
+            return Ok(policy.config());
+        }
         let file = ConfigFile::load()?;
         let store_dir = Self::resolve_store_dir(&file)?;
         let identity_file = Self::resolve_identity_file(&file)?;
@@ -86,13 +94,33 @@ impl Config {
         let editor = Self::resolve_editor(&file);
         let tmpdir = Self::resolve_tmpdir(&file);
 
-        Ok(Self {
+        let config = Self {
             store_dir,
             identity_file,
             recipients_file,
             editor,
             tmpdir,
-        })
+        };
+        config.assert_personal_paths()?;
+        Ok(config)
+    }
+
+    pub(crate) fn assert_personal_paths(&self) -> Result<()> {
+        for path in [&self.store_dir, &self.identity_file, &self.recipients_file] {
+            crate::service::assert_personal_path(path)?;
+        }
+        for relative in [
+            ".revvault",
+            ".revvault/migrations",
+            ".revvault/rotation.toml",
+            ".revvault/rotation-log.jsonl",
+        ] {
+            crate::service::assert_personal_path(&self.store_dir.join(relative))?;
+        }
+        if let Some(path) = &self.tmpdir {
+            crate::service::assert_personal_path(path)?;
+        }
+        Ok(())
     }
 
     fn resolve_store_dir(file: &ConfigFile) -> Result<PathBuf> {
@@ -223,6 +251,81 @@ fn home_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn personal_config_file_cannot_alias_custody_before_read_or_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias = dir.path().join("config.toml");
+        std::os::unix::fs::symlink("/var/lib/revvault/services/19001/identity.txt", &alias)
+            .unwrap();
+        assert_eq!(
+            ConfigFile::load_path(&alias).unwrap_err().to_string(),
+            "revvault_service_capability_denied"
+        );
+        std::fs::remove_file(&alias).unwrap();
+        let personal = dir.path().join("personal.toml");
+        std::fs::write(&personal, "editor = 'builtin'\n").unwrap();
+        std::os::unix::fs::symlink(&personal, &alias).unwrap();
+        assert_eq!(
+            ConfigFile::load_path(&alias).unwrap().editor.as_deref(),
+            Some("builtin")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn personal_configuration_rejects_each_service_custody_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = Config {
+            store_dir: dir.path().join("store"),
+            identity_file: dir.path().join("identity"),
+            recipients_file: dir.path().join("store/.age-recipients"),
+            editor: None,
+            tmpdir: None,
+        };
+        original.assert_personal_paths().unwrap();
+        for field in 0..4 {
+            let mut config = original.clone();
+            let path = PathBuf::from("/var/lib/revvault/services/19001/foreign");
+            match field {
+                0 => config.store_dir = path,
+                1 => config.identity_file = path,
+                2 => config.recipients_file = path,
+                _ => config.tmpdir = Some(path),
+            }
+            assert_eq!(
+                config.assert_personal_paths().unwrap_err().to_string(),
+                "revvault_service_capability_denied"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn personal_config_rejects_derived_metadata_aliases() {
+        for relative in [
+            ".revvault",
+            ".revvault/migrations",
+            ".revvault/rotation.toml",
+            ".revvault/rotation-log.jsonl",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = dir.path().join("store");
+            let alias = store.join(relative);
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("/var/lib/revvault/nonexistent", &alias).unwrap();
+            let config = Config {
+                store_dir: store,
+                identity_file: dir.path().join("identity"),
+                recipients_file: dir.path().join("recipients"),
+                editor: None,
+                tmpdir: None,
+            };
+            assert!(config.assert_personal_paths().is_err());
+            assert!(alias.is_symlink());
+        }
+    }
 
     #[test]
     fn resolve_respects_env_vars() {

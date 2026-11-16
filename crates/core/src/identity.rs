@@ -16,17 +16,27 @@ impl Identity {
     /// The file can contain multiple identity lines (one per line),
     /// plus comment lines starting with `#`.
     pub fn from_file(path: &Path) -> Result<Self> {
-        let contents = fs::read_to_string(path)
-            .map_err(|_| RevvaultError::IdentityNotFound(path.to_path_buf()))?;
+        let contents = zeroize::Zeroizing::new(
+            fs::read_to_string(path)
+                .map_err(|_| RevvaultError::IdentityNotFound(path.to_path_buf()))?,
+        );
+        Self::from_text(&contents)
+    }
 
+    /// Same strict loader for trusted in-memory recovery input; no key file
+    /// staging or separate service-only identity parser.
+    pub(crate) fn from_text(contents: &str) -> Result<Self> {
         let identities: Vec<x25519::Identity> = contents
             .lines()
             .filter(|line| {
                 let trimmed = line.trim();
                 !trimmed.is_empty() && !trimmed.starts_with('#')
             })
-            .filter_map(|line| line.trim().parse::<x25519::Identity>().ok())
-            .collect();
+            .map(|line| line.trim().parse::<x25519::Identity>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| {
+                RevvaultError::DecryptionFailed("invalid age identity in key file".into())
+            })?;
 
         if identities.is_empty() {
             return Err(RevvaultError::DecryptionFailed(
@@ -132,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn from_file_mixed_valid_and_invalid_lines_keeps_only_valid() {
+    fn from_file_rejects_malformed_lines_even_with_valid_identity() {
         let dir = tempfile::tempdir().unwrap();
         let key_file = dir.path().join("keys.txt");
         let valid = x25519::Identity::generate();
@@ -146,8 +156,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = Identity::from_file(&key_file).unwrap();
-        assert_eq!(loaded.as_identities().len(), 1);
+        assert!(Identity::from_file(&key_file).is_err());
     }
 
     #[test]
