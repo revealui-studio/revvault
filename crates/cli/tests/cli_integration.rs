@@ -94,6 +94,142 @@ fn set_force_confirmation_uses_the_same_line() {
 }
 
 #[test]
+fn service_resume_requires_service_policy_and_rejects_personal_overrides() {
+    let (_dir, store, identity) = setup_temp_store();
+    for args in [
+        vec!["init", "--resume"],
+        vec![
+            "init",
+            "--resume",
+            "--service-policy",
+            "/synthetic/policy",
+            "--dry-run",
+        ],
+        vec![
+            "init",
+            "--resume",
+            "--service-policy",
+            "/synthetic/policy",
+            "--store-dir",
+            &store,
+        ],
+        vec![
+            "init",
+            "--resume",
+            "--service-policy",
+            "/synthetic/policy",
+            "--identity-file",
+            &identity,
+        ],
+    ] {
+        revvault_cmd(&store, &identity)
+            .args(args)
+            .assert()
+            .failure();
+    }
+    assert_eq!(std::fs::read_dir(&store).unwrap().count(), 1);
+}
+
+#[test]
+fn source_check_requires_explicit_service_preview_and_closes_denial_errors() {
+    let (_dir, store, identity) = setup_temp_store();
+    for args in [
+        vec!["init", "--source-check"],
+        vec!["init", "--service-policy", "/missing", "--source-check"],
+    ] {
+        revvault_cmd(&store, &identity)
+            .args(args)
+            .assert()
+            .failure();
+    }
+    revvault_cmd(&store, &identity)
+        .args([
+            "--json",
+            "init",
+            "--service-policy",
+            "/nonexistent/synthetic-private-policy",
+            "--dry-run",
+            "--source-check",
+        ])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("revvault_service_capability_denied")
+                .and(predicate::str::contains("synthetic-private-policy").not()),
+        );
+}
+
+#[test]
+fn service_import_denial_never_falls_back_to_operator_store() {
+    let (dir, store, identity) = setup_temp_store();
+    let before = std::fs::read_dir(&store).unwrap().count();
+    revvault_cmd(&store, &identity)
+        .args([
+            "set",
+            "--service-uid",
+            "0",
+            "revealfleet/publisher/synthetic-key",
+        ])
+        .write_stdin("synthetic-secret-must-not-reach-operator-store")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "revvault_service_capability_denied",
+        ));
+    assert_eq!(std::fs::read_dir(&store).unwrap().count(), before);
+    assert!(!dir.path().join("store/revealfleet").exists());
+}
+
+#[test]
+fn service_init_preview_ignores_operator_environment_and_creates_no_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("policy.toml");
+    std::fs::write(
+        &source,
+        r#"
+version = 1
+uid = 1001
+command = ["/usr/local/bin/node", "/app/dist/publisher-run.js"]
+[environment]
+HOME = "/var/lib/revealfleet/publisher"
+[secrets]
+REVEALFLEET_PUBLISHER_DATABASE_URL = "revealfleet/publisher/database-url"
+"#,
+    )
+    .unwrap();
+    let output = assert_cmd::cargo::cargo_bin_cmd!("revvault")
+        .env("HOME", dir.path())
+        .env("REVVAULT_STORE", dir.path().join("operator-store"))
+        .env("REVVAULT_IDENTITY", dir.path().join("operator-identity"))
+        .args(["--json", "init", "--service-policy"])
+        .arg(&source)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["status"], "service_preview");
+    assert_eq!(
+        value["plan"]["store_dir"],
+        "/var/lib/revvault/services/1001/store"
+    );
+    assert_eq!(
+        value["plan"]["policy_file"],
+        "/var/lib/revvault/services/1001/policy.toml"
+    );
+    assert_eq!(
+        value["plan"]["identity_file"],
+        "/var/lib/revvault/services/1001/identity.txt"
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert!(!String::from_utf8(output)
+        .unwrap()
+        .contains("AGE-SECRET-KEY-"));
+}
+
+#[test]
 fn set_empty_stdin_fails() {
     let (_dir, store, identity) = setup_temp_store();
 
@@ -1269,4 +1405,103 @@ fn conditional_set_flags_require_complete_unambiguous_stdin_request() {
             .failure();
     }
     assert!(!Path::new(&store).join("credentials/license.age").exists());
+}
+
+#[test]
+fn service_import_rejects_personal_write_modes_before_reading_input() {
+    for flags in [
+        vec!["--value", "synthetic"],
+        vec!["--force"],
+        vec!["--multiline"],
+        vec![
+            "--operation-id",
+            "35b4a913-3d30-4a23-9ac1-072a55dde99e",
+            "--expected-absent",
+        ],
+    ] {
+        assert_cmd::cargo::cargo_bin_cmd!("revvault")
+            .args([
+                "set",
+                "--service-uid",
+                "19001",
+                "--service-request",
+                "/synthetic/request",
+                "revealfleet/publisher/key",
+            ])
+            .args(flags)
+            .assert()
+            .failure()
+            .code(2);
+    }
+}
+
+#[test]
+fn service_request_requires_service_mode_and_rejects_preview() {
+    for args in [
+        vec!["init", "--service-request", "/missing"],
+        vec![
+            "init",
+            "--service-policy",
+            "/missing",
+            "--service-request",
+            "/missing",
+            "--dry-run",
+        ],
+        vec![
+            "set",
+            "--service-request",
+            "/missing",
+            "revealfleet/publisher/key",
+        ],
+    ] {
+        assert_cmd::cargo::cargo_bin_cmd!("revvault")
+            .args(args)
+            .assert()
+            .failure()
+            .code(2);
+    }
+}
+
+#[test]
+fn request_status_requires_service_inputs_and_excludes_mutation_modes() {
+    for args in [
+        vec!["init", "--request-status"],
+        vec!["init", "--service-policy", "/missing", "--request-status"],
+        vec![
+            "init",
+            "--service-policy",
+            "/missing",
+            "--service-request",
+            "/missing",
+            "--request-status",
+            "--dry-run",
+        ],
+        vec![
+            "init",
+            "--service-policy",
+            "/missing",
+            "--service-request",
+            "/missing",
+            "--request-status",
+            "--resume",
+        ],
+        vec![
+            "init",
+            "--service-policy",
+            "/missing",
+            "--service-request",
+            "/missing",
+            "--request-status",
+            "--restore-archive",
+            "/missing",
+            "--expected-sha256",
+            "invalid",
+        ],
+    ] {
+        assert_cmd::cargo::cargo_bin_cmd!("revvault")
+            .args(args)
+            .assert()
+            .failure()
+            .code(2);
+    }
 }

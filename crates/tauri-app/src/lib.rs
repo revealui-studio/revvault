@@ -1,5 +1,7 @@
+mod clipboard_expiry;
 mod state;
 
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -11,6 +13,8 @@ use tauri::{State, WebviewWindow};
 use zeroize::Zeroizing;
 
 use state::AppState;
+
+static CLIPBOARD_GENERATION: Mutex<u64> = Mutex::new(0);
 
 #[tauri::command]
 fn init_store(state: State<AppState>) -> Result<(), String> {
@@ -147,17 +151,25 @@ fn read_secret(state: &AppState, path: &str) -> Result<Zeroizing<String>, String
 #[tauri::command]
 fn copy_secret(state: State<AppState>, path: String) -> Result<(), String> {
     let value = read_secret(&state, &path)?;
+    let mut generation = CLIPBOARD_GENERATION.lock().map_err(|e| e.to_string())?;
 
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
     clipboard
         .set_text(value.as_str())
         .map_err(|e| e.to_string())?;
+    *generation = generation.wrapping_add(1);
+    let ticket = *generation;
+    drop(generation);
 
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(45));
-        if let Ok(mut cb) = Clipboard::new() {
-            if cb.get_text().ok().as_deref() == Some(value.as_str()) {
-                let _ = cb.set_text("");
+        if let Ok(generation) = CLIPBOARD_GENERATION.lock() {
+            if let Ok(mut cb) = Clipboard::new() {
+                if let Ok(current) = cb.get_text() {
+                    if clipboard_expiry::should_clear(ticket, *generation, &value, &current) {
+                        let _ = cb.set_text("");
+                    }
+                }
             }
         }
     });

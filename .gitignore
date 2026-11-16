@@ -11,6 +11,9 @@ frontend/dist/
 /result
 .direnv/
 
+# Local linked worktrees are separate repositories, not product source.
+/.worktrees/
+
 # IDE
 .vscode/
 .zed/

@@ -1,12 +1,24 @@
-use clap::Args;
+use clap::{Args, ValueEnum};
 use revvault_core::sync::shape;
 use secrecy::ExposeSecret;
 use serde_json::json;
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum EnvFormat {
+    #[default]
+    Auto,
+    Env,
+    Scalar,
+}
 
 #[derive(Args)]
 pub struct ExportEnvArgs {
     /// Secret path (multiline secrets become KEY=VALUE lines)
     pub path: String,
+
+    /// Select env assignments or a scalar value; auto recognizes assignment bundles.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub format: EnvFormat,
 
     /// Refuse to export any value that classifies as a PKCS#8 private key
     /// (GAP-260 P2-2). Use for verify-only namespaces such as
@@ -23,33 +35,80 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Parse the secret into key-value pairs, used by both output modes.
-fn parse_env_vars(path: &str, value: &str) -> Vec<(String, String)> {
-    let has_kv_lines = value
-        .lines()
-        .any(|line| line.contains('=') && !line.starts_with('#'));
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    matches!(chars.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
 
-    if has_kv_lines {
-        value
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    trimmed
+fn parse_env_vars(
+    path: &str,
+    value: &str,
+    format: EnvFormat,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let trimmed = value.trim();
+    // Padded scalar tokens and PEMs are values, not assignment bundles.
+    let padded_scalar = !trimmed.contains('\n')
+        && trimmed.ends_with('=')
+        && !trimmed.trim_end_matches('=').contains('=');
+    let bundle = match format {
+        EnvFormat::Env => true,
+        EnvFormat::Scalar => false,
+        EnvFormat::Auto => {
+            !padded_scalar
+                && !trimmed.starts_with("-----BEGIN ")
+                && value
+                    .lines()
+                    .any(|line| line.contains('=') && !line.trim_start().starts_with('#'))
+                && (trimmed.contains('\n')
+                    || trimmed
                         .split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                } else {
-                    None
+                        .is_some_and(|(k, _)| valid_env_name(k)))
+        }
+    };
+    if bundle {
+        let mut result = Vec::new();
+        let mut lines = value.lines();
+        while let Some(line) = lines.next() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, val) = line
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("invalid environment assignment"))?;
+            anyhow::ensure!(valid_env_name(key), "invalid environment variable name");
+            let mut val = val.to_string();
+            // PEM bundles store real newlines as well as escaped newlines. Keep
+            // the full block as one quoted value, including padded base64 rows.
+            if val.starts_with("-----BEGIN ") && val.ends_with("-----") && !val.contains("\\n") {
+                let end = val.replacen("BEGIN ", "END ", 1);
+                let mut closed = false;
+                for continuation in lines.by_ref() {
+                    val.push('\n');
+                    val.push_str(continuation);
+                    if continuation.trim() == end {
+                        closed = true;
+                        break;
+                    }
                 }
-            })
-            .collect()
+                anyhow::ensure!(closed, "unterminated PEM environment value");
+            }
+            result.push((key.to_string(), val));
+        }
+        Ok(result)
     } else {
-        let var_name = path
+        let key = path
             .rsplit('/')
             .next()
             .unwrap_or(path)
             .to_uppercase()
             .replace('-', "_");
-        vec![(var_name, value.to_string())]
+        anyhow::ensure!(
+            valid_env_name(&key),
+            "secret path does not produce a valid environment variable name"
+        );
+        Ok(vec![(key, value.to_string())])
     }
 }
 
@@ -89,7 +148,7 @@ pub fn load_env_vars(args: &ExportEnvArgs) -> anyhow::Result<Vec<(String, String
     let store = super::open_store()?;
     let secret = store.get(&args.path)?;
     let value = secret.expose_secret();
-    let vars = parse_env_vars(&args.path, value);
+    let vars = parse_env_vars(&args.path, value, args.format)?;
     if args.public_only {
         refuse_private_keys(&vars)?;
     }
@@ -117,4 +176,50 @@ pub fn run(args: ExportEnvArgs, json_output: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shell_exports_reject_untrusted_names() {
+        assert!(parse_env_vars("env", "SAFE=one\nX; touch BAD; #=two", EnvFormat::Auto).is_err());
+        assert!(parse_env_vars("X;false", "value", EnvFormat::Scalar).is_err());
+        assert!(parse_env_vars("env", "X;false=two", EnvFormat::Env).is_err());
+    }
+    #[test]
+    fn multiline_pem_bundle_preserves_base64_padding() {
+        let value = "KEY=-----BEGIN PUBLIC KEY-----\nYWJjZA==\n-----END PUBLIC KEY-----\nEMPTY=";
+        let vars = parse_env_vars("env", value, EnvFormat::Env).unwrap();
+        assert_eq!(
+            vars[0].1,
+            "-----BEGIN PUBLIC KEY-----\nYWJjZA==\n-----END PUBLIC KEY-----"
+        );
+        assert_eq!(vars[1], ("EMPTY".into(), "".into()));
+    }
+    #[test]
+    fn scalar_tokens_and_urls_survive_export() {
+        for value in [
+            "YWJjZA==",
+            "https://example.invalid/?key=value",
+            "-----BEGIN PRIVATE KEY-----\nYWJjZA==\n-----END PRIVATE KEY-----",
+        ] {
+            assert_eq!(
+                parse_env_vars("token", value, EnvFormat::Auto).unwrap(),
+                vec![("TOKEN".into(), value.into())]
+            );
+        }
+        assert_eq!(
+            parse_env_vars("token", "NAME=value", EnvFormat::Scalar).unwrap()[0].1,
+            "NAME=value"
+        );
+        assert_eq!(
+            parse_env_vars("env", "EMPTY=", EnvFormat::Env).unwrap()[0],
+            ("EMPTY".into(), "".into())
+        );
+        assert_eq!(
+            parse_env_vars("env", "NAME=value", EnvFormat::Auto).unwrap()[0],
+            ("NAME".into(), "value".into())
+        );
+    }
 }

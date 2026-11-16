@@ -1,7 +1,9 @@
 {
   "mode": "copy",
   "editor": "claude",
-  "profiles": ["revealfleet"],
+  "profiles": [
+    "revealfleet"
+  ],
   "files": {
     "rules/code-over-docs.md": {
       "source": "profiles/revealfleet/claude/rules/code-over-docs.md",
@@ -17,7 +19,7 @@
     },
     "rules/durable-solutions.md": {
       "source": "profiles/revealfleet/claude/rules/durable-solutions.md",
-      "sha256": "1d9ab978b70bf67f68b65c4b9e06f1065730d1b212fb51d71c42bffc26de1e63"
+      "sha256": "6125eee62f1472030e385d81ac4e678fb8dbfb04879d20ae973b903b17051d5d"
     },
     "rules/exhaustive.md": {
       "source": "profiles/revealfleet/claude/rules/exhaustive.md",

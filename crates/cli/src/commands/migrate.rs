@@ -72,21 +72,30 @@ pub fn run(args: MigrateArgs) -> anyhow::Result<()> {
         }
     }
 
+    if args.delete_originals {
+        for record in &records {
+            revvault_core::service::assert_personal_path(&record.source_path)?;
+        }
+    }
+
     let config = Config::resolve()?;
     let store = PassageStore::open(config)?;
     let manifest = importer.execute(&store, &records)?;
 
     // Write manifest
     let manifest_dir = store.store_dir().join(".revvault/migrations");
+    revvault_core::service::assert_personal_path(&manifest_dir)?;
     std::fs::create_dir_all(&manifest_dir)?;
     let manifest_path = manifest_dir.join(format!("{}.json", manifest.timestamp.replace(':', "-")));
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    revvault_core::service::assert_personal_path(&manifest_path)?;
     std::fs::write(&manifest_path, manifest_json)?;
     eprintln!("\nMigrated {} secrets.", records.len());
     eprintln!("Manifest: {}", manifest_path.display());
 
     if args.delete_originals {
         for record in &records {
+            revvault_core::service::assert_personal_path(&record.source_path)?;
             std::fs::remove_file(&record.source_path)?;
         }
         eprintln!("Deleted {} original files.", records.len());

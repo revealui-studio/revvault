@@ -10,11 +10,13 @@
 //!
 //! - The `apply_sync_after_rotation` step is infallible at the function
 //!   level — sync target failures land as log rows + stderr warnings.
-//! - `post_rotate` hooks are warn-on-failure — a failing hook does not
-//!   abort the rotation (the new key is already in the vault).
+//! - Failed sync prevents in-place revocation. Failed `post_rotate` hooks
+//!   prevent revocation when an HTTP revoke URL is configured. Otherwise
+//!   user hooks retain their historical warn-on-failure behavior.
 //! - The `verify` step is **strict** — a failing verify writes a log
 //!   entry with `verified: false` and then the executor returns Err so
-//!   the cli exits non-zero. Vault state is unchanged.
+//!   the cli exits non-zero. The replacement may already be persisted,
+//!   but the old HTTP credential remains usable. Promotion reruns its gates.
 
 use std::io::Write as _;
 
@@ -45,10 +47,10 @@ fn key_id_path(secret_path: &str) -> String {
 /// 4. Execute rotation (create new key only — no revoke yet)
 /// 5. Write new key to vault
 /// 6. Write new key ID to vault (if provider returned one)
-/// 7. Revoke the previous key (skipped for dual-slot; live stays valid)
-/// 8. Apply post-rotation sync hook (if `[sync.*]` configured)
-/// 9. Run `post_rotate` user hooks (warn-on-failure)
-/// 10. Run `verify` gate (strict — Err on failure)
+/// 7. Apply post-rotation sync hook (if `[sync.*]` configured)
+/// 8. Run `post_rotate` user hooks (strict when revocation is configured)
+/// 9. Run `verify` gate (strict — Err on failure)
+/// 10. Revoke the previous key after all gates (skipped for dual-slot)
 /// 11. Append log entry
 pub async fn execute(
     store: &PassageStore,
@@ -74,6 +76,18 @@ pub async fn execute(
             .map(|s| s.expose_secret().to_string());
         (SecretString::from(current.expose_secret().to_string()), id)
     };
+
+    // Preserve the old credential and ID for recovery if a later sync or verify fails.
+    if !skips_current_key && !provider_config.dual_slot {
+        let previous = slots::previous_path(&provider_config.secret_path);
+        store.upsert(
+            &previous,
+            current_key_for_provider.expose_secret().as_bytes(),
+        )?;
+        if let Some(id) = &old_key_id {
+            store.upsert(&key_id_path(&previous), id.as_bytes())?;
+        }
+    }
 
     // 3. Build provider via factory dispatch on settings["type"].
     let provider = build_provider(
@@ -151,12 +165,6 @@ pub async fn execute(
             .map_err(|e| anyhow::anyhow!("cannot write key ID to vault: {e}"))?;
     }
 
-    // 7. Revoke the previous key only after the new value is in the vault.
-    // Dual-slot keeps live unchanged, so revoking here would lock out the live key.
-    if !provider_config.dual_slot {
-        provider.revoke_previous().await?;
-    }
-
     // 8. Post-rotation sync hook. The vault is already on the
     // new value at this point (live or dual-slot next); sync is best-effort
     // by default and infallible at the function level (failures land as log
@@ -203,7 +211,8 @@ pub async fn execute(
         None
     };
 
-    // 9. post_rotate user hooks (warn-on-failure)
+    // 8. Distribution hook failures must never be followed by revocation.
+    let mut hook_failed = false;
     for cmd in &provider_config.post_rotate {
         eprintln!("  Running post_rotate: {cmd}");
         match tokio::process::Command::new("sh")
@@ -215,6 +224,7 @@ pub async fn execute(
                 eprintln!("  ✓ post_rotate succeeded: {cmd}");
             }
             Ok(output) => {
+                hook_failed = true;
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 eprintln!(
                     "  ⚠ post_rotate command failed (exit {}): {cmd}\n    {}",
@@ -223,12 +233,18 @@ pub async fn execute(
                 );
             }
             Err(e) => {
+                hook_failed = true;
                 eprintln!("  ⚠ post_rotate command could not be executed: {cmd}\n    {e}");
             }
         }
     }
 
-    // 10. verify gate (STRICT — Err on failure)
+    anyhow::ensure!(
+        !hook_failed || !provider_config.settings.contains_key("revoke_url"),
+        "post_rotate failed; old credential retained; repair distribution before revoking it"
+    );
+
+    // 9. verify gate (STRICT — Err on failure)
     let verified: Option<bool> = match &provider_config.verify {
         None => None,
         Some(verify_cmd) => {
@@ -287,7 +303,20 @@ pub async fn execute(
         }
     };
 
-    // 11. Append log entry (success path)
+    // Keep the old credential usable if a consumer failed to receive its replacement.
+    if !provider_config.dual_slot {
+        if sync_log
+            .as_ref()
+            .is_some_and(|rows| rows.iter().any(|row| row.status != "success"))
+        {
+            return Err(anyhow::anyhow!(
+                "sync failed; old credential retained; repair sync before revoking it"
+            ));
+        }
+        provider.revoke_previous().await?;
+    }
+
+    // 10. Append log entry (success path)
     append_log(
         store,
         provider_name,
@@ -331,7 +360,7 @@ pub async fn execute(
 ///
 /// Customer re-mint (`forge/customers/*/license-key`) stays a `post_rotate`
 /// hook (or the existing revforge script) until a later promote subsume PR.
-pub fn promote(
+pub async fn promote(
     store: &PassageStore,
     provider_name: &str,
     provider_config: &ProviderConfig,
@@ -342,6 +371,77 @@ pub fn promote(
         ));
     }
 
+    // Capture old authentication and ID before replacing the live leaves.
+    let provider_type = provider_config.settings.get("type").map(String::as_str);
+    let current_key = if matches!(provider_type, Some("local") | Some("ed25519-keypair")) {
+        SecretString::from(String::new())
+    } else {
+        store.get(&provider_config.secret_path)?
+    };
+    let old_id = store
+        .get(&key_id_path(&provider_config.secret_path))
+        .ok()
+        .map(|value| value.expose_secret().to_string());
+    let provider = build_provider(
+        store,
+        provider_name.to_string(),
+        current_key,
+        old_id.clone(),
+        &provider_config.settings,
+    )?;
+    provider.preflight().await?;
+
+    // Recheck consumers immediately before promotion. A staged rotation may
+    // have had a best-effort sync failure or verification may have changed.
+    let staged = store.get(&slots::next_path(&provider_config.secret_path))?;
+    let sync_log = if let Some(sync_cfg) = &provider_config.sync {
+        let rows = sync_hook::apply_sync_after_rotation(store, sync_cfg, &staged).await;
+        anyhow::ensure!(
+            rows.iter().all(|row| row.status == "success"),
+            "promotion sync failed; live credential retained"
+        );
+        Some(rows)
+    } else {
+        None
+    };
+    anyhow::ensure!(
+        !provider_config.require_verify || provider_config.verify.is_some(),
+        "promotion requires a verify command"
+    );
+    // HTTP distribution hooks may have failed during staging. Retry them before
+    // the verify gate and before any old credential can be revoked.
+    if provider_config.settings.contains_key("revoke_url") {
+        for command in &provider_config.post_rotate {
+            let status = tokio::process::Command::new("sh")
+                .args(["-c", command])
+                .status()
+                .await?;
+            anyhow::ensure!(
+                status.success(),
+                "promotion post_rotate failed; live credential retained"
+            );
+        }
+    }
+    let verified = if let Some(command) = &provider_config.verify {
+        let status = tokio::process::Command::new("sh")
+            .args(["-c", command])
+            .status()
+            .await?;
+        anyhow::ensure!(
+            status.success(),
+            "promotion verification failed; live credential retained"
+        );
+        Some(true)
+    } else {
+        None
+    };
+
+    if let Some(id) = &old_id {
+        store.upsert(
+            &key_id_path(&slots::previous_path(&provider_config.secret_path)),
+            id.as_bytes(),
+        )?;
+    }
     let promoted = slots::promote_leaf(store, &provider_config.secret_path)?;
     eprintln!("  promoted '{}' ← next", provider_config.secret_path);
 
@@ -367,13 +467,17 @@ pub fn promote(
         let _ = store.delete(&next_id);
     }
 
+    // Promotion is the point at which staged credentials become live. A failed
+    // promotion never revokes the credential still used by existing consumers.
+    provider.revoke_previous().await?;
+
     append_log(
         store,
         provider_name,
         &provider_config.secret_path,
         &None,
-        None,
-        None,
+        sync_log,
+        verified,
     )?;
 
     eprintln!("✓ Promoted dual-slot provider '{provider_name}' to live paths");
@@ -529,9 +633,10 @@ fn append_log(
     verified: Option<bool>,
 ) -> anyhow::Result<()> {
     let log_dir = store.store_dir().join(".revvault");
-    std::fs::create_dir_all(&log_dir)?;
-
+    crate::service::assert_personal_path(&log_dir)?;
     let log_path = log_dir.join("rotation-log.jsonl");
+    crate::service::assert_personal_path(&log_path)?;
+    std::fs::create_dir_all(&log_dir)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

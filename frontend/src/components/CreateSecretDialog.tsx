@@ -42,9 +42,8 @@ export function CreateSecretDialog({
     e.preventDefault();
 
     const trimmedPath = path.trim();
-    const trimmedValue = value.trim();
 
-    if (!trimmedPath || !trimmedValue) {
+    if (!trimmedPath || !value) {
       setError("Path and value are required.");
       return;
     }
@@ -55,7 +54,7 @@ export function CreateSecretDialog({
     try {
       await invoke("set_secret", {
         path: trimmedPath,
-        value: trimmedValue,
+        value,
         force: false,
       });
       const createdPath = trimmedPath;

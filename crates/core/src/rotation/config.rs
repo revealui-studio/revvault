@@ -31,9 +31,9 @@ pub struct ProviderConfig {
     pub sync: Option<SyncConfig>,
     /// User-configurable shell commands to run after the vault
     /// write + sync hook complete. Executed sequentially with
-    /// `sh -c`. Failure is **warn-only** — the rotation is not
-    /// aborted because the new key is already live in the vault.
-    /// Use `verify` for a strict gate.
+    /// `sh -c`. Failure prevents HTTP credential revocation and returns
+    /// an error when `revoke_url` is configured; otherwise it is warn-only.
+    /// HTTP promotion retries these hooks before verification and revocation.
     #[serde(default)]
     pub post_rotate: Vec<String>,
     /// Optional strict verification command. When set, runs after
