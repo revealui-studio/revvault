@@ -68,7 +68,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
             className="w-full"
             onClick={onComplete}
           >
-            Open Vault
+            Open vault
           </Button>
         </div>
       </div>
@@ -79,11 +79,11 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
     <div className="flex h-screen items-center justify-center bg-neutral-950">
       <div className="w-full max-w-lg rounded-lg border border-neutral-700 bg-neutral-900 p-8">
         <div className="mb-2 text-2xl font-semibold text-neutral-100">
-          Set up RevVault
+          Create your encrypted vault
         </div>
         <p className="mb-6 text-sm text-neutral-400">
-          No vault found. Initialize one to get started — this will create a
-          store directory and generate an age encryption key.
+          Set up a local store for your secrets and an encryption identity. Back up the
+          identity file so you can decrypt your vault later.
         </p>
 
         {error && (
@@ -116,7 +116,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
           disabled={loading}
           isLoading={loading}
         >
-          Initialize Vault
+          Set up vault
         </Button>
       </div>
     </div>

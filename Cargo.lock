@@ -4601,10 +4601,12 @@ dependencies = [
  "ed25519-dalek",
  "fuzzy-matcher",
  "hex",
+ "libc",
  "mockito",
  "rand 0.10.2",
  "rand_core 0.6.4",
  "reqwest",
+ "rust-embed",
  "secrecy",
  "serde",
  "serde_json",
@@ -4615,6 +4617,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "uuid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]

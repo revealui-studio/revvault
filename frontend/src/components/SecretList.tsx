@@ -11,7 +11,7 @@ export function SecretList({ secrets, selected, onSelect }: SecretListProps) {
   if (secrets.length === 0) {
     return (
       <div className="flex flex-1 items-center justify-center text-neutral-500">
-        No secrets found
+        No secrets to show
       </div>
     );
   }

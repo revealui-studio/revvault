@@ -6,7 +6,7 @@ import { SearchBar } from "./SearchBar";
 describe("SearchBar", () => {
   it("renders with placeholder text", () => {
     render(<SearchBar query="" onSearch={vi.fn()} />);
-    expect(screen.getByPlaceholderText("Search secrets...")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search secret names and paths")).toBeInTheDocument();
   });
 
   it("reflects the controlled query prop value", () => {

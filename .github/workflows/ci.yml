@@ -48,6 +48,33 @@ jobs:
       - name: cargo test -p revvault-core -p revvault-cli --all-targets
         run: cargo test -p revvault-core -p revvault-cli --all-targets
 
+  native-service-custody:
+    name: Native service custody, replacement and independent restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build maintained disposable fixture
+        run: docker build -f crates/core/tests/service-provisioning.Dockerfile -t revealfleet-vault-native-tests .
+      - name: Prepare synthetic custody and verify replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          volume="revealfleet-custody-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          recovery_volume="revealfleet-recovery-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          authority_volume="revealfleet-recovery-authority-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          restore_volume="revealfleet-restored-custody-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "$volume" >/dev/null
+          trap 'docker volume rm "$volume" "$recovery_volume" "$authority_volume" "$restore_volume" >/dev/null' EXIT
+          docker volume create "$recovery_volume" >/dev/null
+          docker volume create "$authority_volume" >/dev/null
+          docker volume create "$restore_volume" >/dev/null
+          docker run --rm --network none --cpus 2 --memory 2g --pids-limit 256 --mount "type=volume,src=$volume,dst=/var/lib/revvault" --mount "type=volume,src=$recovery_volume,dst=/root/revealfleet-backup-proof" --mount "type=volume,src=$authority_volume,dst=/root/revealfleet-recovery-authority" revealfleet-vault-native-tests
+          docker run --rm --network none --cpus 2 --memory 2g --pids-limit 256 --mount "type=volume,src=$volume,dst=/var/lib/revvault" --env REVEALFLEET_NATIVE_SERVICE_REPLACEMENT=1 revealfleet-vault-native-tests
+          docker run --rm --network none --cpus 2 --memory 2g --pids-limit 256 --mount "type=volume,src=$restore_volume,dst=/var/lib/revvault" --mount "type=volume,src=$recovery_volume,dst=/root/revealfleet-backup-proof,readonly" --mount "type=volume,src=$authority_volume,dst=/root/revealfleet-recovery-authority,readonly" --env REVEALFLEET_NATIVE_SERVICE_RESTORE=1 revealfleet-vault-native-tests
+
   fmt:
     name: cargo fmt --check
     runs-on: ubuntu-latest
@@ -152,13 +179,23 @@ jobs:
           # workflow file (which has to mention the literal patterns to
           # scan for them) doesn't match itself.
           includes=(--include='*.sh' --include='*.ps1' --include='*.psm1' --include='*.psd1')
-          hits=$(grep -rn 'joshu\b' "${includes[@]}" . || true)
+          scan_status=0
+          hits=$(grep -rn 'joshu\b' "${includes[@]}" .) || scan_status=$?
+          if (( scan_status > 1 )); then
+            echo "::error::Hardcoded user-account scan could not complete."
+            exit 1
+          fi
           if [ -n "$hits" ]; then
             echo "::error::Hardcoded user-account name found in scripted files."
             echo "$hits"
             exit 1
           fi
-          mnt_hits=$(grep -rn '/mnt/c/Users/joshu' "${includes[@]}" . || true)
+          scan_status=0
+          mnt_hits=$(grep -rn '/mnt/c/Users/joshu' "${includes[@]}" .) || scan_status=$?
+          if (( scan_status > 1 )); then
+            echo "::error::Windows user-path scan could not complete."
+            exit 1
+          fi
           if [ -n "$mnt_hits" ]; then
             echo "::error::Hardcoded /mnt/c/Users path found in scripted files."
             echo "$mnt_hits"
@@ -264,15 +301,35 @@ jobs:
         # `cargo update -p plist`, delete both ignores from
         # .cargo/audit.toml, and delete this step.
         run: |
-          target="$(cargo update --dry-run -p plist 2>&1 | awk '/Updating quick-xml/ {print $NF}')"
-          echo "quick-xml reachable via 'cargo update -p plist': ${target:-none (lockfile already at ceiling)}"
-          case "$target" in
-            ""|v0.39.*|v0.40.*)
-              echo "quick-xml >=0.41 still unreachable — the audit.toml ignores remain justified." ;;
-            *)
-              echo "::error::quick-xml $target is now reachable; >=0.41 fixes RUSTSEC-2026-0194/0195. Bump the lockfile, remove both ignores from .cargo/audit.toml, and delete this guard step."
-              exit 1 ;;
-          esac
+          set -euo pipefail
+          update_output="$(cargo update --dry-run -p plist 2>&1)"
+          echo "$update_output"
+          CARGO_UPDATE_OUTPUT="$update_output" python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import tomllib
+
+          with open('Cargo.lock', 'rb') as lockfile:
+              packages = tomllib.load(lockfile)['package']
+          locked = [pkg['version'] for pkg in packages if pkg['name'] == 'quick-xml']
+          if not locked:
+              sys.exit('::error::quick-xml is absent from Cargo.lock; review the stale ignores')
+
+          output = os.environ['CARGO_UPDATE_OUTPUT']
+          updates = re.findall(r'Updating quick-xml v\S+ -> v(\d+\.\d+\.\d+)', output)
+          additions = re.findall(r'Adding quick-xml v(\d+\.\d+\.\d+)', output)
+          if re.search(r'(?:Updating|Adding|Removing|Downgrading) quick-xml\b', output) and not (updates or additions):
+              sys.exit('::error::cannot parse quick-xml version from cargo update output')
+
+          versions = locked + updates + additions
+          print(f'quick-xml locked: {locked}; reachable: {updates + additions or "no update"}')
+          for version in versions:
+              major, minor, _ = map(int, version.split('.'))
+              if major > 0 or minor >= 41:
+                  sys.exit(f'::error::quick-xml {version} is available; remove RUSTSEC-2026-0194/0195 ignores')
+          print('quick-xml >=0.41 remains unreachable; temporary ignores remain justified')
+          PY
 
   deny:
     # cargo-deny checks: license compliance (allow-list in deny.toml),

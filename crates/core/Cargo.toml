@@ -7,9 +7,20 @@ license.workspace = true
 authors.workspace = true
 description = "Shared vault library for Revvault — age-encrypted secret store"
 
+[features]
+native-service-tests = []
+
+[[test]]
+name = "service_provisioning_native"
+required-features = ["native-service-tests"]
+
 [dependencies]
+libc = { workspace = true }
 async-trait = "0.1"
 age = { workspace = true }
+# age error localization must survive standalone debug/test executables without
+# a Cargo registry at runtime. Features unify with age's existing rust-embed.
+rust-embed = { version = "8", features = ["debug-embed", "deterministic-timestamps"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,10 +38,12 @@ hex = { workspace = true }
 uuid = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 rand_core = { workspace = true }
 
-[dev-dependencies]
 tempfile = "3"
+
+[dev-dependencies]
 age = { workspace = true }
 secrecy = { workspace = true }
 mockito = "1"

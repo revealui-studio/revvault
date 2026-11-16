@@ -279,6 +279,11 @@ impl RotationProvider for GenericHttpProvider {
             })
         });
 
+        Ok(RotationOutcome::single(new_value, new_key_id))
+    }
+
+    async fn revoke_old(&self) -> Result<()> {
+        let client = reqwest::Client::new();
         // --- Step 2: Revoke old key ---
         if let Some(ref url_template) = self.revoke_url {
             // Substitute {old_key} with the key value, {old_key_id} with the stored ID.
@@ -308,6 +313,6 @@ impl RotationProvider for GenericHttpProvider {
             }
         }
 
-        Ok(RotationOutcome::single(new_value, new_key_id))
+        Ok(())
     }
 }

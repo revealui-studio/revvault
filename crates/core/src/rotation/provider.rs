@@ -72,7 +72,12 @@ pub trait RotationProvider: Send + Sync {
     /// Return a human-readable description of what `rotate` would do.
     async fn dry_run(&self) -> Result<String>;
 
-    /// Execute the rotation: create new key, revoke old key.
+    /// Create the replacement key. The current key must remain usable.
     /// Returns the new secret value and optional key ID; does not touch the vault.
     async fn rotate(&self) -> Result<RotationOutcome>;
+
+    /// Revoke the old key only after the replacement is persisted and verified.
+    async fn revoke_old(&self) -> Result<()> {
+        Ok(())
+    }
 }

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SecretDetail } from "./SecretDetail";
@@ -126,4 +126,31 @@ describe("SecretDetail", () => {
     expect(mockInvoke).not.toHaveBeenCalled();
     expect(onDeleted).not.toHaveBeenCalled();
   });
+  it("discards a delayed reveal after selecting another secret", async () => {
+    const user = userEvent.setup();
+    let resolveOld!: (value: string) => void;
+    mockInvoke.mockReturnValueOnce(new Promise<string>((resolve) => { resolveOld = resolve; }));
+    const { rerender } = render(<SecretDetail path="misc/old" onDeleted={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Reveal" }));
+    rerender(<SecretDetail path="misc/new" onDeleted={vi.fn()} />);
+    await act(async () => { resolveOld("old secret"); });
+    expect(screen.queryByText("old secret")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reveal" })).toBeEnabled();
+    mockInvoke.mockResolvedValueOnce("new secret").mockResolvedValueOnce(undefined);
+    await user.click(screen.getByRole("button", { name: "Copy" }));
+    expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", { value: "new secret" });
+  });
+
+  it("does not copy a pending old selection after switching away and back", async () => {
+    const user = userEvent.setup();
+    let resolveOld!: (value: string) => void;
+    mockInvoke.mockReturnValueOnce(new Promise<string>((resolve) => { resolveOld = resolve; }));
+    const { rerender } = render(<SecretDetail path="misc/old" onDeleted={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Copy" }));
+    rerender(<SecretDetail path="misc/new" onDeleted={vi.fn()} />);
+    rerender(<SecretDetail path="misc/old" onDeleted={vi.fn()} />);
+    await act(async () => { resolveOld("old secret"); });
+    expect(mockInvoke).not.toHaveBeenCalledWith("copy_to_clipboard", expect.anything());
+  });
+
 });

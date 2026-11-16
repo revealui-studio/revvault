@@ -11,7 +11,7 @@ pub struct RotationPromoteArgs {
     pub provider: String,
 }
 
-pub fn run(args: RotationPromoteArgs) -> anyhow::Result<()> {
+pub async fn run(args: RotationPromoteArgs) -> anyhow::Result<()> {
     let config = Config::resolve()?;
     let rotation_config = RotationConfig::load(&config.store_dir)?;
 
@@ -23,5 +23,5 @@ pub fn run(args: RotationPromoteArgs) -> anyhow::Result<()> {
         })?;
 
     let store = PassageStore::open(config)?;
-    executor::promote(&store, &args.provider, provider_config)
+    executor::promote(&store, &args.provider, provider_config).await
 }

@@ -14,26 +14,97 @@
 //! `setSecrets` mutation (= one Fly release) and passes `replaceAll: false`
 //! so secrets not in the manifest are never deleted.
 //!
-//! # Retry
+//! # Transport boundary
 //!
-//! The transport retries `429 Too Many Requests` with backoffs of 100ms /
-//! 500ms / 2000ms — identical policy to the Vercel client. Other
-//! non-2xx statuses surface immediately. GraphQL-level errors (HTTP 200 with a
-//! non-empty `errors` array) are also surfaced as `Err`.
+//! Reads may retry bounded 429 responses within one fixed whole-operation
+//! deadline. Mutations are dispatched once, including on 429 or an uncertain
+//! response. Provider bodies and parser/transport errors never cross the error
+//! boundary. This generic sync client does not establish service provisioning
+//! authority, custody, target acceptance or safe replay.
 //!
-//! # Test injection
-//!
-//! [`FlyClient::with_base_url`] swaps the default `https://api.fly.io/graphql`
-//! endpoint for a mockito server URL so the request shape + retry can be
-//! exercised without network access or a real Fly token.
+//! Endpoint injection is retained for synthetic callers via `with_base_url`;
+//! the service observation path independently uses its fixed Machines endpoint.
 
 use std::time::Duration;
 
-use anyhow::{bail, Context};
-use serde::{Deserialize, Serialize};
+use anyhow::{bail, Result};
+use reqwest::redirect::Policy;
+use serde::{
+    de::{DeserializeOwned, IgnoredAny},
+    Deserialize, Serialize,
+};
+use zeroize::Zeroizing;
+
+mod service;
+pub use service::{FlyServiceTarget, FlyServiceTargetEvidence};
 
 const DEFAULT_BASE_URL: &str = "https://api.fly.io/graphql";
 const RETRY_BACKOFFS_MS: [u64; 3] = [100, 500, 2000];
+const TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RESPONSE: usize = 1024 * 1024;
+const MAX_REQUEST: usize = 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum FlyTransportError {
+    #[error("revvault_fly_request_denied")]
+    RequestDenied,
+    #[error("revvault_fly_observation_unverified")]
+    ObservationUnverified,
+    #[error("revvault_fly_mutation_outcome_unknown")]
+    MutationOutcomeUnknown,
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Read,
+    Mutation,
+}
+
+impl Operation {
+    fn error(self) -> FlyTransportError {
+        match self {
+            Self::Read => FlyTransportError::ObservationUnverified,
+            Self::Mutation => FlyTransportError::MutationOutcomeUnknown,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GraphQlResponse<T> {
+    data: Option<T>,
+    // Ignore error contents while requiring the GraphQL array/null shape.
+    // Deserialization never retains arbitrary error strings or config values.
+    errors: Option<Vec<IgnoredAny>>,
+}
+
+#[derive(Deserialize)]
+struct SecretsData {
+    app: Option<SecretsApp>,
+}
+#[derive(Deserialize)]
+struct SecretsApp {
+    secrets: Vec<FlySecret>,
+}
+#[derive(Deserialize)]
+struct MutationData {
+    #[serde(rename = "setSecrets")]
+    set_secrets: MutationPayload,
+}
+#[derive(Deserialize)]
+struct MutationPayload {
+    release: MutationRelease,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MutationRelease {
+    Released(Release),
+    NoRelease(()),
+}
+#[derive(Deserialize)]
+struct Release {
+    id: String,
+    version: i64,
+}
 
 // ── Fly API types ─────────────────────────────────────────────────────────
 
@@ -59,9 +130,8 @@ pub struct SetSecretsResult {
 /// Constructed via [`FlyClient::new`] for production use; tests use
 /// [`FlyClient::with_base_url`] to point requests at a mock server.
 pub struct FlyClient {
-    token: String,
+    token: Zeroizing<String>,
     base: String,
-    client: reqwest::Client,
 }
 
 impl FlyClient {
@@ -69,9 +139,8 @@ impl FlyClient {
     /// a Fly API token (org token or app deploy token) — passed as a bearer.
     pub fn new(token: String) -> Self {
         Self {
-            token,
+            token: Zeroizing::new(token),
             base: DEFAULT_BASE_URL.to_string(),
-            client: reqwest::Client::new(),
         }
     }
 
@@ -82,106 +151,119 @@ impl FlyClient {
         self
     }
 
-    /// Send a request, retrying up to 3 times on `429 Too Many Requests` with
-    /// backoffs of 100ms / 500ms / 2000ms. Builder must be cloneable; a JSON
-    /// body (the only kind this client sends) is fine.
-    async fn send_retrying(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> anyhow::Result<reqwest::Response> {
-        let mut attempt = 0usize;
-        loop {
-            let cloned = builder
-                .try_clone()
-                .expect("FlyClient request must be cloneable for retry-on-429");
-            let resp = cloned.send().await.context("Failed to reach Fly API")?;
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                && attempt < RETRY_BACKOFFS_MS.len()
-            {
-                tokio::time::sleep(Duration::from_millis(RETRY_BACKOFFS_MS[attempt])).await;
-                attempt += 1;
-                continue;
-            }
-            return Ok(resp);
-        }
-    }
-
-    /// POST a GraphQL operation and return the parsed JSON `data`-bearing body.
-    /// Surfaces transport errors, non-2xx HTTP, and GraphQL `errors` as `Err`.
-    async fn graphql(
+    async fn graphql<T: DeserializeOwned>(
         &self,
         query: &str,
         variables: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
+        operation: Operation,
+    ) -> Result<T> {
+        self.graphql_with_timeout(query, variables, operation, TIMEOUT)
+            .await
+    }
+
+    // Only tests select a short deadline. No environment or runtime knob can
+    // remove the production whole-operation bound, including retry/backoff.
+    async fn graphql_with_timeout<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+        operation: Operation,
+        timeout: Duration,
+    ) -> Result<T> {
+        if self.token.trim().is_empty() {
+            bail!(FlyTransportError::RequestDenied);
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .build()
+            .map_err(|_| FlyTransportError::RequestDenied)?;
         let body = serde_json::json!({ "query": query, "variables": variables });
-        let req = self
-            .client
+        // Serialize into a fixed buffer before dispatch; rejected requests do
+        // not acquire an uncertain provider outcome. The HTTP-owned request
+        // body remains subject to the transport library's normal lifetime.
+        let mut serialized = Zeroizing::new(vec![0_u8; MAX_REQUEST]);
+        let size = {
+            let mut writer = std::io::Cursor::new(serialized.as_mut_slice());
+            serde_json::to_writer(&mut writer, &body)
+                .map_err(|_| FlyTransportError::RequestDenied)?;
+            writer.position() as usize
+        };
+        let request = client
             .post(&self.base)
-            .bearer_auth(&self.token)
-            .json(&body);
-        let resp = self.send_retrying(req).await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("Fly GraphQL returned {}: {}", status, text);
-        }
-
-        let value: serde_json::Value = resp.json().await.context("parsing Fly GraphQL JSON")?;
-        if let Some(errors) = value.get("errors") {
-            if errors.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                bail!("Fly GraphQL errors: {}", errors);
+            .bearer_auth(self.token.as_str())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serialized[..size].to_vec())
+            .build()
+            .map_err(|_| FlyTransportError::RequestDenied)?;
+        let work = async {
+            let mut attempt = 0;
+            let mut response = loop {
+                let attempt_request = request.try_clone().ok_or_else(|| operation.error())?;
+                let response = client.execute(attempt_request).await?;
+                if matches!(operation, Operation::Read)
+                    && response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    && attempt < RETRY_BACKOFFS_MS.len()
+                {
+                    drop(response);
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFFS_MS[attempt])).await;
+                    attempt += 1;
+                    continue;
+                }
+                break response;
+            };
+            if !response.status().is_success()
+                || response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_RESPONSE as u64)
+            {
+                bail!(operation.error());
             }
-        }
-        Ok(value)
+            // Fixed allocation, bounded chunks, erased raw body on every exit.
+            let mut bytes = Zeroizing::new(vec![0_u8; MAX_RESPONSE]);
+            let mut size = 0;
+            while let Some(chunk) = response.chunk().await? {
+                if chunk.len() > MAX_RESPONSE - size {
+                    bail!(operation.error());
+                }
+                bytes[size..size + chunk.len()].copy_from_slice(&chunk);
+                size += chunk.len();
+            }
+            let response: GraphQlResponse<T> = serde_json::from_slice(&bytes[..size])?;
+            if response.errors.is_some_and(|errors| !errors.is_empty()) {
+                bail!(operation.error());
+            }
+            let data = response.data.ok_or_else(|| operation.error())?;
+            Ok::<T, anyhow::Error>(data)
+        };
+        tokio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| operation.error())?
+            .map_err(|_| operation.error().into())
     }
 
     /// List the NAMES (+ opaque digests) of secrets set on a Fly app. Returns
     /// an empty vec when the app has no secrets; errors when the app is not
     /// found (wrong name or insufficient token scope).
     pub async fn list_secret_names(&self, app_name: &str) -> anyhow::Result<Vec<FlySecret>> {
+        if app_name.len() > MAX_REQUEST {
+            bail!(FlyTransportError::RequestDenied);
+        }
         let query = r#"query($name: String!) { app(name: $name) { secrets { name digest } } }"#;
-        let value = self
-            .graphql(query, serde_json::json!({ "name": app_name }))
-            .await?;
-
-        #[derive(Deserialize)]
-        struct SecretNode {
-            name: String,
-            digest: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct AppNode {
-            secrets: Vec<SecretNode>,
-        }
-        #[derive(Deserialize)]
-        struct Data {
-            app: Option<AppNode>,
-        }
-
-        let data: Data = serde_json::from_value(
-            value
-                .get("data")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        )
-        .context("unexpected Fly app.secrets response shape")?;
-
-        let app = data.app.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Fly app '{}' not found (check the app name and that the token has access)",
-                app_name
+        let data: SecretsData = self
+            .graphql(
+                query,
+                serde_json::json!({ "name": app_name }),
+                Operation::Read,
             )
-        })?;
-
-        Ok(app
-            .secrets
-            .into_iter()
-            .map(|s| FlySecret {
-                name: s.name,
-                digest: s.digest,
-            })
-            .collect())
+            .await?;
+        Ok(data
+            .app
+            .ok_or(FlyTransportError::ObservationUnverified)?
+            .secrets)
     }
 
     /// Set (create or update) secrets on a Fly app in one batched mutation,
@@ -194,6 +276,20 @@ impl FlyClient {
         secrets: &[(String, String)],
         replace_all: bool,
     ) -> anyhow::Result<SetSecretsResult> {
+        let mut input_size = app_name.len();
+        for (key, value) in secrets {
+            input_size = input_size
+                .checked_add(key.len())
+                .and_then(|size| size.checked_add(value.len()))
+                .and_then(|size| size.checked_add(64))
+                .ok_or(FlyTransportError::RequestDenied)?;
+            if input_size > MAX_REQUEST {
+                bail!(FlyTransportError::RequestDenied);
+            }
+        }
+        if input_size > MAX_REQUEST {
+            bail!(FlyTransportError::RequestDenied);
+        }
         let mutation = r#"mutation($input: SetSecretsInput!) { setSecrets(input: $input) { release { id version } } }"#;
         let secret_inputs: Vec<serde_json::Value> = secrets
             .iter()
@@ -206,16 +302,27 @@ impl FlyClient {
                 "replaceAll": replace_all,
             }
         });
-        let value = self.graphql(mutation, variables).await?;
-
-        let release = value
-            .pointer("/data/setSecrets/release")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        Ok(SetSecretsResult {
-            release_id: release.get("id").and_then(|v| v.as_str()).map(String::from),
-            release_version: release.get("version").and_then(serde_json::Value::as_i64),
-        })
+        let data: MutationData = self
+            .graphql(mutation, variables, Operation::Mutation)
+            .await?;
+        match data.set_secrets.release {
+            MutationRelease::Released(release)
+                if !release.id.is_empty()
+                    && release.id.len() <= 256
+                    && !release.id.chars().any(char::is_control)
+                    && release.version >= 0 =>
+            {
+                Ok(SetSecretsResult {
+                    release_id: Some(release.id),
+                    release_version: Some(release.version),
+                })
+            }
+            MutationRelease::NoRelease(()) => Ok(SetSecretsResult {
+                release_id: None,
+                release_version: None,
+            }),
+            _ => Err(FlyTransportError::MutationOutcomeUnknown.into()),
+        }
     }
 }
 
@@ -275,7 +382,7 @@ mod tests {
 
         let client = FlyClient::new("tok".into()).with_base_url(server.url());
         let err = client.list_secret_names("nope").await.unwrap_err();
-        assert!(format!("{err}").contains("not found"));
+        assert_eq!(err.to_string(), "revvault_fly_observation_unverified");
     }
 
     #[tokio::test]
@@ -325,7 +432,7 @@ mod tests {
 
         let client = FlyClient::new("tok".into()).with_base_url(server.url());
         let err = client.list_secret_names("x").await.unwrap_err();
-        assert!(format!("{err}").contains("GraphQL errors"));
+        assert_eq!(err.to_string(), "revvault_fly_observation_unverified");
     }
 
     #[tokio::test]
@@ -366,7 +473,283 @@ mod tests {
 
         let client = FlyClient::new("tok".into()).with_base_url(server.url());
         let err = client.list_secret_names("p").await.unwrap_err();
-        assert!(format!("{err}").contains("500"));
+        assert_eq!(err.to_string(), "revvault_fly_observation_unverified");
         m.assert_async().await;
+    }
+    async fn mutate(client: &FlyClient) -> Result<SetSecretsResult> {
+        client
+            .set_secrets(
+                "revealfleet-transport-fixture",
+                &[("KEY".into(), "synthetic-private-value".into())],
+                false,
+            )
+            .await
+    }
+
+    fn assert_closed(error: anyhow::Error, expected: &str) {
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(format!("{error:#}"), expected);
+        assert!(!format!("{error:?}").contains("synthetic-private"));
+        assert!(error.downcast_ref::<FlyTransportError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn mutation_errors_never_retry_or_relay_provider_bodies() {
+        for status in [401, 403, 429, 500, 503] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock("POST", "/")
+                .with_status(status)
+                .with_body("synthetic-private-provider-error")
+                .expect(1)
+                .create_async()
+                .await;
+            assert_closed(
+                mutate(&FlyClient::new("synthetic-token".into()).with_base_url(server.url()))
+                    .await
+                    .unwrap_err(),
+                "revvault_fly_mutation_outcome_unknown",
+            );
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_missing_mutation_acknowledgements_remain_unknown() {
+        for body in [
+            r#"{"errors":[{"message":"synthetic-private-value"}],"data":{"setSecrets":{"release":null}}}"#,
+            r#"{"errors":"synthetic-private-errors","data":{"setSecrets":{"release":null}}}"#,
+            r#"{"data":null}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{"setSecrets":null}}"#,
+            r#"{"data":{"setSecrets":{}}}"#,
+            r#"{"data":{"setSecrets":{"release":{}}}}"#,
+            r#"{"data":{"setSecrets":{"release":{"id":"synthetic-private-id","version":"synthetic-private-version"}}}}"#,
+            r#"{"data":{"setSecrets":{"release":{"id":"","version":7}}}}"#,
+            r#"{"data":{"setSecrets":{"release":{"id":"rel_1","version":-1}}}}"#,
+            "synthetic-private-invalid-json",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_body(body)
+                .expect(1)
+                .create_async()
+                .await;
+            assert_closed(
+                mutate(&FlyClient::new("synthetic-token".into()).with_base_url(server.url()))
+                    .await
+                    .unwrap_err(),
+                "revvault_fly_mutation_outcome_unknown",
+            );
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_null_release_is_an_acknowledgement_without_release_provenance() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server.mock("POST", "/").with_status(200)
+            .with_body(r#"{"data":{"setSecrets":{"release":null}},"errors":[],"extensions":{"ignored":"synthetic-private-extension"}}"#)
+            .expect(1).create_async().await;
+        let result = mutate(&FlyClient::new("synthetic-token".into()).with_base_url(server.url()))
+            .await
+            .unwrap();
+        assert!(result.release_id.is_none() && result.release_version.is_none());
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_credentials_are_denied_before_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let no_request = server.mock("POST", "/").expect(0).create_async().await;
+        for token in ["", " ", "synthetic-private-token\ninvalid"] {
+            let client = FlyClient::new(token.into()).with_base_url(server.url());
+            assert_closed(
+                mutate(&client).await.unwrap_err(),
+                "revvault_fly_request_denied",
+            );
+            assert_closed(
+                client.list_secret_names("fixture").await.unwrap_err(),
+                "revvault_fly_request_denied",
+            );
+        }
+        assert_closed(
+            mutate(&FlyClient::new("synthetic-token".into()).with_base_url("not a URL"))
+                .await
+                .unwrap_err(),
+            "revvault_fly_request_denied",
+        );
+        no_request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn raw_and_escaped_request_overflow_are_denied_before_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let no_request = server.mock("POST", "/").expect(0).create_async().await;
+        let client = FlyClient::new("synthetic-token".into()).with_base_url(server.url());
+        for value in [
+            "x".repeat(MAX_REQUEST + 1),
+            "\u{0001}".repeat(MAX_REQUEST / 3),
+        ] {
+            assert_closed(
+                client
+                    .set_secrets("fixture", &[("KEY".into(), value)], false)
+                    .await
+                    .unwrap_err(),
+                "revvault_fly_request_denied",
+            );
+        }
+        no_request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn redirects_cannot_forward_a_read_or_mutation() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("POST", "/")
+            .with_status(307)
+            .with_header("location", "/must-not-follow")
+            .expect(2)
+            .create_async()
+            .await;
+        let no_redirect = server
+            .mock("POST", "/must-not-follow")
+            .expect(0)
+            .create_async()
+            .await;
+        let client = FlyClient::new("synthetic-token".into()).with_base_url(server.url());
+        assert_closed(
+            mutate(&client).await.unwrap_err(),
+            "revvault_fly_mutation_outcome_unknown",
+        );
+        assert_closed(
+            client.list_secret_names("fixture").await.unwrap_err(),
+            "revvault_fly_observation_unverified",
+        );
+        request.assert_async().await;
+        no_redirect.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn declared_and_streamed_response_overflow_remain_closed() {
+        for chunked in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server.mock("POST", "/").with_status(200).expect(2);
+            let mock = if chunked {
+                mock.with_chunked_body(|writer| {
+                    let body = serde_json::json!({"data":{"setSecrets":{"release":null},"app":{"secrets":[]}},"ignored":"x".repeat(MAX_RESPONSE)}).to_string();
+                    let _ = writer.write_all(body.as_bytes());
+                    Ok(())
+                })
+            } else {
+                mock.with_body(serde_json::json!({"data":{"setSecrets":{"release":null},"app":{"secrets":[]}},"ignored":"x".repeat(MAX_RESPONSE)}).to_string())
+            };
+            let request = mock.create_async().await;
+            let client = FlyClient::new("synthetic-token".into()).with_base_url(server.url());
+            assert_closed(
+                mutate(&client).await.unwrap_err(),
+                "revvault_fly_mutation_outcome_unknown",
+            );
+            assert_closed(
+                client.list_secret_names("fixture").await.unwrap_err(),
+                "revvault_fly_observation_unverified",
+            );
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_deadline_does_not_authorize_mutation_replay() {
+        for operation in [Operation::Read, Operation::Mutation] {
+            use std::io::{Read, Write};
+            use std::sync::mpsc;
+            // An owned server avoids pooled mock servers whose previous
+            // blocking body callbacks can postpone accepting this request.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (observed_tx, observed_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let (mut socket, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("synthetic listener failed: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                let mut byte = [0];
+                while !headers.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 8192);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{",
+                    )
+                    .unwrap();
+                socket.flush().unwrap();
+                observed_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            });
+            let client = FlyClient::new("synthetic-token".into()).with_base_url(url);
+            let started = std::time::Instant::now();
+            let error = client
+                .graphql_with_timeout::<SecretsData>(
+                    "synthetic-query",
+                    serde_json::json!({}),
+                    operation,
+                    Duration::from_millis(500),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_closed(error, &operation.error().to_string());
+            assert!(started.elapsed() < Duration::from_millis(1500));
+            let observed = observed_rx.recv_timeout(Duration::from_secs(1));
+            let _ = release_tx.send(());
+            server.join().unwrap();
+            observed.expect("timeout must follow an observed dispatched request");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_retry_backoff_has_one_operation_deadline() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("POST", "/")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+        let client = FlyClient::new("synthetic-token".into()).with_base_url(server.url());
+        let started = std::time::Instant::now();
+        let error = client
+            .graphql_with_timeout::<SecretsData>(
+                "synthetic-query",
+                serde_json::json!({}),
+                Operation::Read,
+                Duration::from_millis(400),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_closed(error, "revvault_fly_observation_unverified");
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        request.assert_async().await;
     }
 }

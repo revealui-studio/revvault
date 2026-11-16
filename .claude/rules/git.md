@@ -7,6 +7,17 @@
 - Description in imperative mood, lowercase, no period
 - Keep subject line under 72 characters
 
+## GitHub CLI (`gh`) — repo pin form
+
+Prefer short `-R owner/repo` over long `--repo`. Always pin the repo so the
+command works from any cwd. Prefer unquoted labels when the label has no spaces.
+
+```bash
+gh pr edit 2482 -R RevealUIStudio/revealui --add-label sec-review:approved
+```
+
+Owner-action one-liners in wrap-ups must use this form (see disposition-actions).
+
 ## Branch Naming
 - Feature: `feat/<short-description>` or `feat/<issue#>-<short-description>`
 - Bugfix: `fix/<short-description>` or `fix/<issue#>-<short-description>`

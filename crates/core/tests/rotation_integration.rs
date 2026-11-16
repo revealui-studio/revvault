@@ -268,6 +268,7 @@ async fn rotate_revokes_old_key_by_value() {
     let outcome = p.rotate().await.unwrap();
 
     assert_eq!(outcome.new_value.expose_secret(), "brand-new-key");
+    p.revoke_old().await.unwrap();
     _revoke.assert_async().await;
 }
 
@@ -309,6 +310,7 @@ async fn rotate_revokes_old_key_by_id() {
 
     assert_eq!(outcome.new_value.expose_secret(), "new-key");
     assert_eq!(outcome.new_key_id.as_deref(), Some("new-id-456"));
+    p.revoke_old().await.unwrap();
     _revoke.assert_async().await;
 }
 
@@ -967,7 +969,9 @@ async fn dual_slot_rotate_writes_next_not_live() {
     assert!(prev.expose_secret().contains("old"));
 
     // Promote flips next → live.
-    executor::promote(&store, "license-signing", &provider_config).unwrap();
+    executor::promote(&store, "license-signing", &provider_config)
+        .await
+        .unwrap();
     let after = store.get("revdev/license-signing-private-key").unwrap();
     assert!(after.expose_secret().starts_with(pkcs8_hdr));
     assert!(!after.expose_secret().contains("old\n"));
@@ -977,8 +981,8 @@ async fn dual_slot_rotate_writes_next_not_live() {
         .is_err());
 }
 
-#[test]
-fn promote_without_dual_slot_errors() {
+#[tokio::test]
+async fn promote_without_dual_slot_errors() {
     let (_dir, store) = setup_store();
     let provider_config = revvault_core::rotation::config::ProviderConfig {
         secret_path: "x".into(),
@@ -991,12 +995,14 @@ fn promote_without_dual_slot_errors() {
         dual_slot: false,
         output_shape: None,
     };
-    let err = executor::promote(&store, "x", &provider_config).unwrap_err();
+    let err = executor::promote(&store, "x", &provider_config)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("dual_slot"));
 }
 
-#[test]
-fn promote_mirrors_legacy_paths() {
+#[tokio::test]
+async fn promote_mirrors_legacy_paths() {
     let (_dir, store) = setup_store();
     let live_priv = "-----BEGIN PRIVATE KEY-----\nLIVEPRIV\n-----END PRIVATE KEY-----\n";
     let live_pub = "-----BEGIN PUBLIC KEY-----\nLIVEPUB\n-----END PUBLIC KEY-----\n";
@@ -1030,7 +1036,9 @@ fn promote_mirrors_legacy_paths() {
         output_shape: None,
     };
 
-    executor::promote(&store, "license-signing", &provider_config).unwrap();
+    executor::promote(&store, "license-signing", &provider_config)
+        .await
+        .unwrap();
     assert_eq!(
         store
             .get("revdev/license-signing-key")
@@ -1045,4 +1053,152 @@ fn promote_mirrors_legacy_paths() {
             .expose_secret(),
         live_pub
     );
+}
+
+fn unavailable_sync() -> revvault_core::rotation::sync_hook::SyncConfig {
+    use revvault_core::rotation::sync_hook::{SyncConfig, VercelEnvVarRef, VercelSyncRef};
+    SyncConfig {
+        vercel: Some(VercelSyncRef {
+            api_token_path: "missing/sync-token".into(),
+            project_id: "test-project".into(),
+            team_id: None,
+            env_vars: vec![VercelEnvVarRef {
+                name: "TOKEN".into(),
+                targets: vec!["production".into()],
+                sensitive: false,
+            }],
+        }),
+    }
+}
+
+#[tokio::test]
+async fn rotation_never_revokes_before_persistence_and_validation() {
+    for failure in ["shape", "persistence", "verify", "post_rotate", "sync"] {
+        let mut server = Server::new_async().await;
+        let create = server
+            .mock("POST", "/keys")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"key":"replacement","id":"next-id"}"#)
+            .create_async()
+            .await;
+        let revoke = server
+            .mock("DELETE", "/keys/current")
+            .expect(0)
+            .create_async()
+            .await;
+        let (_dir, store) = setup_store();
+        store.set("svc/token", b"current").unwrap();
+        let mut config = revvault_core::rotation::config::ProviderConfig {
+            secret_path: "svc/token".into(),
+            settings: settings(&[
+                ("create_url", &format!("{}/keys", server.url())),
+                ("response_field", "key"),
+                ("id_field", "id"),
+                ("revoke_url", &format!("{}/keys/{{old_key}}", server.url())),
+            ]),
+            sync: None,
+            post_rotate: vec![],
+            verify: None,
+            require_verify: false,
+            sync_must_succeed: false,
+            dual_slot: false,
+            output_shape: None,
+        };
+        match failure {
+            "shape" => config.output_shape = Some(revvault_core::sync::shape::Shape::PemPrivateKey),
+            // The value is saved but the key-ID write fails. The old remote key stays valid.
+            "persistence" => {
+                std::fs::create_dir(store.store_dir().join("svc/token-id.age")).unwrap()
+            }
+            "verify" => config.verify = Some("exit 1".into()),
+            "post_rotate" => config.post_rotate = vec!["exit 1".into()],
+            "sync" => config.sync = Some(unavailable_sync()),
+            _ => unreachable!(),
+        }
+        assert!(
+            executor::execute(&store, "svc", &config).await.is_err(),
+            "{failure}"
+        );
+        create.assert_async().await;
+        revoke.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn dual_slot_retains_live_key_until_promoted() {
+    let mut server = Server::new_async().await;
+    let create = server
+        .mock("POST", "/keys")
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"key":"replacement","id":"next-id"}"#)
+        .create_async()
+        .await;
+    let revoke = server
+        .mock("DELETE", "/keys/current")
+        .with_status(204)
+        .create_async()
+        .await;
+    let (_dir, store) = setup_store();
+    store.set("svc/token", b"current").unwrap();
+    store.set("svc/token-id", b"current-id").unwrap();
+    store.set("svc/token-previous-id", b"recovery-id").unwrap();
+    let mut config = revvault_core::rotation::config::ProviderConfig {
+        secret_path: "svc/token".into(),
+        settings: settings(&[
+            ("create_url", &format!("{}/keys", server.url())),
+            ("response_field", "key"),
+            ("id_field", "id"),
+            ("revoke_url", &format!("{}/keys/{{old_key}}", server.url())),
+        ]),
+        sync: None,
+        post_rotate: vec![],
+        verify: None,
+        require_verify: false,
+        sync_must_succeed: false,
+        dual_slot: true,
+        output_shape: None,
+    };
+    config.verify = Some("exit 1".into());
+    assert!(executor::execute(&store, "svc", &config).await.is_err());
+    assert!(!revoke.matched_async().await);
+    assert_eq!(store.get("svc/token").unwrap().expose_secret(), "current");
+    let mut failed_sync = config.clone();
+    failed_sync.sync = Some(unavailable_sync());
+    assert!(executor::promote(&store, "svc", &failed_sync)
+        .await
+        .is_err());
+    assert!(!revoke.matched_async().await);
+    assert_eq!(store.get("svc/token").unwrap().expose_secret(), "current");
+    let mut failed_hook = config.clone();
+    failed_hook.post_rotate = vec!["exit 1".into()];
+    assert!(executor::promote(&store, "svc", &failed_hook)
+        .await
+        .is_err());
+    assert!(!revoke.matched_async().await);
+    assert_eq!(store.get("svc/token").unwrap().expose_secret(), "current");
+    let mut failed_verify = config.clone();
+    failed_verify.verify = Some("exit 1".into());
+    assert!(executor::promote(&store, "svc", &failed_verify)
+        .await
+        .is_err());
+    assert!(!revoke.matched_async().await);
+    assert_eq!(store.get("svc/token").unwrap().expose_secret(), "current");
+    assert_eq!(
+        store.get("svc/token-previous-id").unwrap().expose_secret(),
+        "recovery-id"
+    );
+    config.verify = None;
+    executor::promote(&store, "svc", &config).await.unwrap();
+    assert_eq!(
+        store.get("svc/token").unwrap().expose_secret(),
+        "replacement"
+    );
+    assert_eq!(
+        store.get("svc/token-previous-id").unwrap().expose_secret(),
+        "current-id"
+    );
+    create.assert_async().await;
+    revoke.assert_async().await;
 }

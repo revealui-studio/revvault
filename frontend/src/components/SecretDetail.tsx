@@ -1,5 +1,5 @@
 import { Button } from "@revealui/presentation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface SecretDetailProps {
@@ -7,7 +7,12 @@ interface SecretDetailProps {
   onDeleted: () => void;
 }
 
-export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
+export function SecretDetail(props: SecretDetailProps) {
+  return <SelectedSecretDetail key={props.path} {...props} />;
+}
+
+function SelectedSecretDetail({ path, onDeleted }: SecretDetailProps) {
+  const active = useRef(true);
   const [revealed, setRevealed] = useState(false);
   const [value, setValue] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -15,11 +20,11 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setRevealed(false);
-    setValue(null);
-    setCopied(false);
-    setError(null);
-  }, [path]);
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
 
   if (!path) {
     return (
@@ -40,6 +45,7 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
     setError(null);
     try {
       const result = await invoke<string>("get_secret", { path });
+      if (!active.current) return;
       setValue(result);
       setRevealed(true);
     } catch (e) {
@@ -53,6 +59,7 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
     setError(null);
     try {
       const secret = value ?? (await invoke<string>("get_secret", { path }));
+      if (!active.current) return;
       await invoke("copy_to_clipboard", { value: secret });
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -66,7 +73,7 @@ export function SecretDetail({ path, onDeleted }: SecretDetailProps) {
     setError(null);
     try {
       await invoke("delete_secret", { path });
-      onDeleted();
+      if (active.current) onDeleted();
     } catch (e) {
       setError(String(e));
     }

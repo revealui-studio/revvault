@@ -77,7 +77,8 @@ pub fn run(args: EditArgs) -> anyhow::Result<()> {
     }
 
     // External editor path: write decrypted content to a secure temp file.
-    let (tmp_path, tmp_fd) = secure_tmp(&tmp_config, &current)?;
+    let temporary = secure_tmp(&tmp_config, &current)?;
+    let tmp_path = &temporary.path;
 
     let parts: Vec<&str> = editor_cmd.split_whitespace().collect();
     let (bin, extra_args) = parts
@@ -90,20 +91,19 @@ pub fn run(args: EditArgs) -> anyhow::Result<()> {
 
     let status = Command::new(&bin_path)
         .args(extra_args)
-        .arg(&tmp_path)
+        .arg(tmp_path)
         .status()?;
 
     if !status.success() {
-        cleanup_tmp(tmp_fd, &tmp_path);
         anyhow::bail!("editor exited with non-zero status");
     }
 
     // Read back and re-encrypt
-    let new_value = Zeroizing::new(std::fs::read_to_string(&tmp_path)?);
+    let new_value = Zeroizing::new(std::fs::read_to_string(tmp_path)?);
     let trimmed = Zeroizing::new(new_value.trim().to_string());
 
     // Zero out the temp file contents on disk before removal
-    cleanup_tmp(tmp_fd, &tmp_path);
+    drop(temporary);
 
     if *trimmed == current.trim() {
         eprintln!("No changes made.");
@@ -116,15 +116,15 @@ pub fn run(args: EditArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns `(path_for_editor, optional_memfd_owner)`.
+/// Returns an owner that cleans plaintext on every normal return path.
 ///
 /// Priority:
-///   1. Linux: `memfd_create` — anonymous in-memory file at `/proc/self/fd/<n>`
-///   2. Linux/WSL2: `/dev/shm` if it is a tmpfs mount
+///   1. Linux/WSL2: `/dev/shm` if it is a tmpfs mount
+///   2. Linux: `memfd_create` — anonymous in-memory storage
 ///   3. macOS: `NamedTempFile` with `F_NOCACHE`
 ///   4. `config.tmpdir` / `TMPDIR` / OS default tempdir
 #[allow(unused_variables)]
-fn secure_tmp(config: &TmpConfig, content: &str) -> anyhow::Result<(PathBuf, Option<MemfdHandle>)> {
+fn secure_tmp(config: &TmpConfig, content: &str) -> anyhow::Result<SecretTemp> {
     // --- Strategy 1: /dev/shm tmpfs (Linux / WSL2) ---
     // Preferred over memfd because GUI editors (Zed, VS Code) use atomic
     // temp-rename saves that require a real filesystem path.
@@ -138,9 +138,12 @@ fn secure_tmp(config: &TmpConfig, content: &str) -> anyhow::Result<(PathBuf, Opt
                 let shm_tmp = tempfile::NamedTempFile::new_in("/dev/shm")?;
                 std::fs::write(shm_tmp.path(), content)?;
                 let path = shm_tmp.path().to_path_buf();
-                // Forget the handle — cleanup_tmp will overwrite + unlink
-                std::mem::forget(shm_tmp);
-                return Ok((path, None));
+                // Retain ownership so error exits also scrub and unlink.
+                return Ok(SecretTemp {
+                    path,
+                    memfd: None,
+                    file: Some(shm_tmp),
+                });
             }
         }
     }
@@ -164,7 +167,11 @@ fn secure_tmp(config: &TmpConfig, content: &str) -> anyhow::Result<(PathBuf, Opt
                 mfd.as_raw_fd()
             };
             let proc_path = PathBuf::from(format!("/proc/{}/fd/{fd_num}", std::process::id()));
-            return Ok((proc_path, Some(mfd)));
+            return Ok(SecretTemp {
+                path: proc_path,
+                memfd: Some(mfd),
+                file: None,
+            });
         }
     }
 
@@ -179,8 +186,11 @@ fn secure_tmp(config: &TmpConfig, content: &str) -> anyhow::Result<(PathBuf, Opt
         }
         std::fs::write(tmp.path(), content)?;
         let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
-        return Ok((path, None));
+        return Ok(SecretTemp {
+            path,
+            memfd: None,
+            file: Some(tmp),
+        });
     }
 
     // --- Strategy 4: config.tmpdir / TMPDIR / OS default ---
@@ -194,22 +204,56 @@ fn secure_tmp(config: &TmpConfig, content: &str) -> anyhow::Result<(PathBuf, Opt
         let tmp = tempfile::NamedTempFile::new_in(&base_dir)?;
         std::fs::write(tmp.path(), content)?;
         let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
-        Ok((path, None))
+        Ok(SecretTemp {
+            path,
+            memfd: None,
+            file: Some(tmp),
+        })
     }
 }
 
-/// Overwrite the temp file with zeros then remove it.
-///
-/// For a `memfd`, the kernel reclaims the memory when the last fd is closed
-/// (i.e., when `mfd` is dropped here).
-fn cleanup_tmp(mfd: Option<MemfdHandle>, path: &std::path::Path) {
-    if mfd.is_none() && path.exists() {
-        if let Ok(meta) = std::fs::metadata(path) {
-            let zeros = vec![0u8; meta.len() as usize];
-            let _ = std::fs::write(path, &zeros);
+/// Owns plaintext storage through every early return, including editor spawn/read errors.
+struct SecretTemp {
+    path: PathBuf,
+    memfd: Option<MemfdHandle>,
+    file: Option<tempfile::NamedTempFile>,
+}
+
+impl Drop for SecretTemp {
+    fn drop(&mut self) {
+        if self.memfd.is_none() {
+            if let Ok(meta) = std::fs::metadata(&self.path) {
+                let _ = std::fs::write(&self.path, vec![0u8; meta.len() as usize]);
+            }
+            // Editors may replace the inode during save; remove the path too.
+            let _ = std::fs::remove_file(&self.path);
         }
-        let _ = std::fs::remove_file(path);
+        self.file.take();
+        self.memfd.take();
     }
-    drop(mfd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn plaintext_is_removed_after_editor_spawn_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::write(&path, "synthetic secret").unwrap();
+        let run = || -> std::io::Result<()> {
+            let temporary = SecretTemp {
+                path: path.clone(),
+                memfd: None,
+                file: Some(file),
+            };
+            Command::new(dir.path().join("missing-editor"))
+                .arg(&temporary.path)
+                .status()?;
+            Ok(())
+        };
+        assert!(run().is_err());
+        assert!(!path.exists());
+    }
 }

@@ -13,11 +13,11 @@
     },
     "rules/disposition-actions.md": {
       "source": "profiles/revealfleet/claude/rules/disposition-actions.md",
-      "sha256": "cf3f1aa1f927dfac43494127590f6334239c3bc0619956e78a1b26e05b9e07b8"
+      "sha256": "db2e1964f359e0df046788ee7b828168efd8ea27c20384edc99fe5647404a603"
     },
     "rules/durable-solutions.md": {
       "source": "profiles/revealfleet/claude/rules/durable-solutions.md",
-      "sha256": "f9e78060960246700075c76a326117d68dd30ec5f570d3789a2e759f9b61f11c"
+      "sha256": "e0f9e89ff89c1c3ebc76721201137372e8867be19d2594b3d7f4b662ceb1e865"
     },
     "rules/extend-before-create.md": {
       "source": "profiles/revealfleet/claude/rules/extend-before-create.md",
@@ -25,7 +25,7 @@
     },
     "rules/git.md": {
       "source": "profiles/revealfleet/claude/rules/git.md",
-      "sha256": "a8c582428a148f5c3d8f07a96256b157606a5244d2e9d8e3d2ae81aef230dbd3"
+      "sha256": "4e11ecc80ceb49e7e4042cb2dab1928648d4312d048b3f4cffc7dda856b01897"
     },
     "rules/model-allocation.md": {
       "source": "profiles/revealfleet/claude/rules/model-allocation.md",
@@ -41,7 +41,7 @@
     },
     "rules/planning.md": {
       "source": "profiles/revealfleet/claude/rules/planning.md",
-      "sha256": "40f86eac435bea8ad4b84ae45e76b0bb3a6ea97b81e684d95a6cbb80a932509c"
+      "sha256": "338133fa1ca5296e131236b320484dc0dc969665dce6bc4426583374f665ec0e"
     },
     "rules/secrets.md": {
       "source": "profiles/revealfleet/claude/rules/secrets.md",

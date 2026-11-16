@@ -120,4 +120,16 @@ describe("CreateSecretDialog", () => {
 
     expect(onClose).toHaveBeenCalled();
   });
+  it("preserves whitespace in secret values", async () => {
+    const user = userEvent.setup();
+    mockInvoke.mockResolvedValue(undefined);
+    render(<CreateSecretDialog open={true} onClose={vi.fn()} onCreated={vi.fn()} />);
+    await user.type(screen.getByPlaceholderText("credentials/stripe/secret-key"), "misc/key");
+    await user.type(screen.getByPlaceholderText("Secret value..."), "  secret{Enter} ");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    expect(mockInvoke).toHaveBeenCalledWith("set_secret", {
+      path: "misc/key", value: "  secret\n ", force: false,
+    });
+  });
+
 });

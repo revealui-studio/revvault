@@ -12,7 +12,7 @@ export function SearchBar({ query, onSearch }: SearchBarProps) {
         type="text"
         value={query}
         onChange={(e) => onSearch(e.target.value)}
-        placeholder="Search secrets..."
+        placeholder="Search secret names and paths"
       />
     </div>
   );

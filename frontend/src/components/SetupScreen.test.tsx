@@ -25,9 +25,9 @@ describe("SetupScreen", () => {
 
   it("renders the initial setup prompt", () => {
     render(<SetupScreen onComplete={vi.fn()} />);
-    expect(screen.getByText("Set up RevVault")).toBeInTheDocument();
+    expect(screen.getByText("Create your encrypted vault")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Initialize Vault" })
+      screen.getByRole("button", { name: "Set up vault" })
     ).toBeInTheDocument();
   });
 
@@ -45,7 +45,7 @@ describe("SetupScreen", () => {
 
     render(<SetupScreen onComplete={vi.fn()} />);
 
-    await user.click(screen.getByRole("button", { name: "Initialize Vault" }));
+    await user.click(screen.getByRole("button", { name: "Set up vault" }));
 
     await waitFor(() =>
       expect(screen.getByText("Vault ready")).toBeInTheDocument()
@@ -53,16 +53,16 @@ describe("SetupScreen", () => {
     expect(screen.getByText("age1abc123")).toBeInTheDocument();
   });
 
-  it("calls onComplete when 'Open Vault' is clicked after init", async () => {
+  it("calls onComplete when 'Open vault' is clicked after init", async () => {
     const onComplete = vi.fn();
     const user = userEvent.setup();
     mockInvoke.mockResolvedValue(mockSummary);
 
     render(<SetupScreen onComplete={onComplete} />);
 
-    await user.click(screen.getByRole("button", { name: "Initialize Vault" }));
+    await user.click(screen.getByRole("button", { name: "Set up vault" }));
     await screen.findByText("Vault ready");
-    await user.click(screen.getByRole("button", { name: "Open Vault" }));
+    await user.click(screen.getByRole("button", { name: "Open vault" }));
 
     expect(onComplete).toHaveBeenCalled();
   });
@@ -73,7 +73,7 @@ describe("SetupScreen", () => {
 
     render(<SetupScreen onComplete={vi.fn()} />);
 
-    await user.click(screen.getByRole("button", { name: "Initialize Vault" }));
+    await user.click(screen.getByRole("button", { name: "Set up vault" }));
 
     await waitFor(() =>
       expect(screen.getByText("Error: permission denied")).toBeInTheDocument()

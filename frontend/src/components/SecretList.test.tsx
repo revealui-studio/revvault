@@ -12,7 +12,7 @@ const secrets: SecretInfo[] = [
 describe("SecretList", () => {
   it("shows empty state when no secrets", () => {
     render(<SecretList secrets={[]} selected={null} onSelect={vi.fn()} />);
-    expect(screen.getByText("No secrets found")).toBeInTheDocument();
+    expect(screen.getByText("No secrets to show")).toBeInTheDocument();
   });
 
   it("renders each secret's full path", () => {

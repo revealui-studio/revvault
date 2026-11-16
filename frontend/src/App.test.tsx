@@ -70,10 +70,10 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() =>
-      expect(screen.getByText("Set up RevVault")).toBeInTheDocument()
+      expect(screen.getByText("Create your encrypted vault")).toBeInTheDocument()
     );
     expect(
-      screen.getByRole("button", { name: "Initialize Vault" })
+      screen.getByRole("button", { name: "Set up vault" })
     ).toBeInTheDocument();
   });
 
@@ -105,7 +105,7 @@ describe("App", () => {
     );
 
     await user.type(
-      screen.getByPlaceholderText("Search secrets..."),
+      screen.getByPlaceholderText("Search secret names and paths"),
       "stripe"
     );
 
@@ -135,7 +135,7 @@ describe("App", () => {
       expect(screen.getByText("credentials/stripe/key")).toBeInTheDocument()
     );
 
-    const input = screen.getByPlaceholderText("Search secrets...");
+    const input = screen.getByPlaceholderText("Search secret names and paths");
     await user.type(input, "stripe");
     await waitFor(() =>
       expect(mockInvoke).toHaveBeenCalledWith("search_secrets", {
