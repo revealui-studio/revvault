@@ -34,6 +34,17 @@ direnv allow  # or: nix develop
 cargo build --workspace
 ```
 
+The Nix shell and CI select Node26.13.1. The locked Nix package manager stays
+on pnpm10, matching the frontend CI policy; a future frontend `packageManager`
+pin must match the Nix package. Nix owns tools and native libraries inside the
+shell; the ordinary user shell can continue using nvm.
+
+Run `nix build --no-link .#checks.x86_64-linux.runtime` for a small Node/ABI147,
+ESM and package-manager resolution check. Estimate the full Rust/Tauri/Mesa
+closure with `nix build --dry-run .#devShells.x86_64-linux.default` before
+realizing it when WSL space is reserved for recovery. Neither command activates
+a service or modifies the vault.
+
 ### CLI Usage
 
 ```bash
