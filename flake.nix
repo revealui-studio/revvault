@@ -48,7 +48,7 @@
         ];
 
         # Mesa drivers for EGL/GL (needed for WebKitGTK rendering)
-        mesaDrivers = pkgs.mesa.drivers;
+        mesaDrivers = pkgs.mesa;
 
         # All native build inputs
         nativeBuildInputs = with pkgs; [
